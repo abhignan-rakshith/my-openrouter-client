@@ -71,19 +71,26 @@ static void sse_line(StreamState *st, const char *line)
 
     char *piece = extract_delta(data);
     if (piece) {
-        if (buf_append_str(&st->reply, piece) != 0)
-            st->oom = true;
-        /* First visible content clears the spinner. A live-render callback
-         * takes over display (fed the whole reply so far); otherwise, when
-         * printing, echo just the new token. In quiet/buffered mode both
-         * are off and the spinner runs until the transfer completes. */
-        if (!st->oom && st->on_update) {
-            stream_stop_spinner(st);
-            st->on_update(st->reply.data, st->on_update_user);
-        } else if (!st->oom && st->printing) {
-            stream_stop_spinner(st);
-            fputs(piece, stdout);
-            fflush(stdout);
+        /* Providers emit empty content deltas before the first real token
+         * (an initial role announcement, keep-alives). Ignore them: acting
+         * on one would stop the spinner ~a second early and leave a silent
+         * gap. Keep spinning until actual text arrives. */
+        if (*piece) {
+            if (buf_append_str(&st->reply, piece) != 0)
+                st->oom = true;
+            /* First visible content clears the spinner. A live-render
+             * callback takes over display (fed the whole reply so far);
+             * otherwise, when printing, echo just the new token. In
+             * quiet/buffered mode both are off and the spinner runs until
+             * the transfer completes. */
+            if (!st->oom && st->on_update) {
+                stream_stop_spinner(st);
+                st->on_update(st->reply.data, st->on_update_user);
+            } else if (!st->oom && st->printing) {
+                stream_stop_spinner(st);
+                fputs(piece, stdout);
+                fflush(stdout);
+            }
         }
         free(piece);
         return;
