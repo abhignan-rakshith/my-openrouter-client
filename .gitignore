@@ -1,0 +1,26 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Build output
+/orc
+/src/*.o
+*.dSYM/
+
+# Local conversation history
+/conversations/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Crash dumps and logs
+core
+core.*
+*.log
