@@ -6,7 +6,7 @@ LDFLAGS += -pthread
 LDLIBS   = $(shell pkg-config --libs libcurl libcmark)
 
 SRC := src/main.c src/api.c src/conv.c src/jsonutil.c src/config.c src/buffer.c \
-       src/spinner.c src/md.c
+       src/spinner.c src/md.c src/userconfig.c
 OBJ := $(SRC:.c=.o)
 HDR := $(wildcard src/*.h)
 

@@ -6,6 +6,7 @@
  *   orc                       interactive chat, auto-named conversation
  *   orc -c NAME               resume (or start) conversation NAME
  *   orc -c NAME "prompt"      one turn appended to conversation NAME
+ *   orc config ...            manage persistent settings (key, model)
  *
  * Options:
  *   -m MODEL      model id (default: DEFAULT_MODEL)
@@ -37,6 +38,7 @@
 #include "config.h"
 #include "conv.h"
 #include "md.h"
+#include "userconfig.h"
 
 #define DEFAULT_MODEL "google/gemini-3.6-flash"
 
@@ -59,16 +61,132 @@ static void usage(const char *prog)
     fprintf(stderr,
         "Usage: %s [-m model] [-c name] [--no-stream] [--no-markdown]"
         " [\"prompt\"]\n"
-        "  -m model     model id (default: %s)\n"
+        "       %s config <set|get|unset|list|path> ...\n"
+        "  -m model     model id (default: %s, or the saved config value)\n"
         "  -c name      persist to conversations/<name>.jsonl\n"
         "  --no-stream  wait for the full response instead of streaming\n"
         "  --no-markdown  stream plain text only; skip the Markdown re-render\n"
         "\n"
         "With no prompt, an interactive chat session starts. In a terminal the\n"
-        "reply streams in as plain text, then re-renders with Markdown styling.\n"
+        "reply renders live as Markdown as it streams.\n"
         "In the chat, /rename NAME renames the conversation.\n"
-        "/quit (or Ctrl-D) ends the session.\n",
-        prog, DEFAULT_MODEL);
+        "/quit (or Ctrl-D) ends the session.\n"
+        "\n"
+        "Persistent settings (~/.config/orc/config, 0600):\n"
+        "  %s config set key <API_KEY>     save the OpenRouter API key\n"
+        "  %s config set model <model-id>  save the default model\n"
+        "  %s config get <key|model>       show a saved value (key masked)\n"
+        "  %s config list                  show all saved settings\n"
+        "  %s config unset <key|model>     remove a saved value\n"
+        "  %s config path                  print the config file location\n",
+        prog, prog, DEFAULT_MODEL, prog, prog, prog, prog, prog, prog);
+}
+
+/* Map a user-facing setting name to its stored key, or nullptr if unknown. */
+static const char *config_key_for(const char *name)
+{
+    if (strcmp(name, "key") == 0)   return ORC_KEY_NAME;
+    if (strcmp(name, "model") == 0) return "model";
+    return nullptr;
+}
+
+/* Render a masked preview of a secret into out (e.g. "sk-or-…a1b2"). */
+static void mask_secret(const char *s, char *out, size_t outsz)
+{
+    size_t n = strlen(s);
+    if (n <= 8)
+        snprintf(out, outsz, "********");
+    else
+        snprintf(out, outsz, "%.6s…%.4s", s, s + n - 4);
+}
+
+/* Print one setting for `config get`/`list`, masking the key. */
+static void config_print(const char *label, const char *ui_name, char *value)
+{
+    if (!value) {
+        printf("%s(not set)\n", label);
+        return;
+    }
+    if (strcmp(ui_name, "key") == 0) {
+        char masked[64];
+        mask_secret(value, masked, sizeof masked);
+        printf("%s%s\n", label, masked);
+    } else {
+        printf("%s%s\n", label, value);
+    }
+    free(value);
+}
+
+/*
+ * Handle `orc config ...`. Returns a process exit code. Does not require an
+ * API key, so it is dispatched before the normal startup path.
+ */
+static int run_config_cmd(int argc, char **argv)
+{
+    const char *sub = argc >= 3 ? argv[2] : "";
+
+    if (strcmp(sub, "path") == 0) {
+        char *p = uconf_path();
+        if (!p) {
+            fprintf(stderr, "error: no HOME or XDG_CONFIG_HOME set\n");
+            return 1;
+        }
+        printf("%s\n", p);
+        free(p);
+        return 0;
+    }
+
+    if (strcmp(sub, "list") == 0) {
+        config_print("key:   ", "key", uconf_get(ORC_KEY_NAME));
+        config_print("model: ", "model", uconf_get("model"));
+        return 0;
+    }
+
+    if (strcmp(sub, "set") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "usage: orc config set <key|model> <value>\n");
+            return 1;
+        }
+        const char *stored = config_key_for(argv[3]);
+        if (!stored) {
+            fprintf(stderr, "error: unknown setting '%s' (use 'key' or 'model')\n", argv[3]);
+            return 1;
+        }
+        if (uconf_set(stored, argv[4]) != 0)
+            return 1;   /* uconf_set already reported the error */
+        if (strcmp(argv[3], "key") == 0) {
+            char masked[64];
+            mask_secret(argv[4], masked, sizeof masked);
+            printf("Saved API key (%s).\n", masked);
+        } else {
+            printf("Saved model = %s\n", argv[4]);
+        }
+        return 0;
+    }
+
+    if (strcmp(sub, "get") == 0) {
+        if (argc < 4 || !config_key_for(argv[3])) {
+            fprintf(stderr, "usage: orc config get <key|model>\n");
+            return 1;
+        }
+        config_print("", argv[3], uconf_get(config_key_for(argv[3])));
+        return 0;
+    }
+
+    if (strcmp(sub, "unset") == 0) {
+        if (argc < 4 || !config_key_for(argv[3])) {
+            fprintf(stderr, "usage: orc config unset <key|model>\n");
+            return 1;
+        }
+        if (uconf_unset(config_key_for(argv[3])) != 0)
+            return 1;
+        printf("Unset %s.\n", argv[3]);
+        return 0;
+    }
+
+    fprintf(stderr, "error: unknown config command '%s'\n", sub);
+    usage(argv[0]);
+    return 1;
 }
 
 /*
@@ -79,7 +197,7 @@ static void usage(const char *prog)
 static bool parse_args(int argc, char **argv, Options *opts, int *exit_code)
 {
     *opts = (Options){
-        .model    = DEFAULT_MODEL,
+        .model    = nullptr,   /* resolved after parsing: -m > config > default */
         .prompt   = nullptr,
         .conv_name = nullptr,
         .stream   = true,
@@ -444,6 +562,10 @@ static char *resolve_path(const Options *opts, char *namebuf, size_t namesz,
 
 int main(int argc, char **argv)
 {
+    /* `orc config ...` manages persistent settings and needs no API key. */
+    if (argc >= 2 && strcmp(argv[1], "config") == 0)
+        return run_config_cmd(argc, argv);
+
     /* Required for terminal cell-width calculations (emoji, CJK,
      * combining marks) used by the Markdown table renderer. */
     setlocale(LC_CTYPE, "");
@@ -460,8 +582,9 @@ int main(int argc, char **argv)
     if (!api_key) {
         fprintf(stderr,
                 "error: no API key found.\n"
-                "Set %s in the environment or in %s\n",
-                ORC_KEY_NAME, ORC_ENV_FILE);
+                "Set %s in the environment or a .env file, or run:\n"
+                "  %s config set key <API_KEY>\n",
+                ORC_KEY_NAME, argv[0]);
         return 1;
     }
 
@@ -483,6 +606,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Resolve the model: -m flag > saved config > built-in default. */
+    char *model_alloc = nullptr;
+    if (!opts.model) {
+        model_alloc = uconf_get("model");
+        opts.model = model_alloc ? model_alloc : DEFAULT_MODEL;
+    }
+
     OrRequest base = {
         .api_key  = api_key,
         .model    = opts.model,
@@ -500,5 +630,6 @@ int main(int argc, char **argv)
 
     buf_free(&items);
     free(api_key);
+    free(model_alloc);
     return status;
 }
