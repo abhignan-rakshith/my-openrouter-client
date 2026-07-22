@@ -10,11 +10,14 @@
  * Options:
  *   -m MODEL      model id (default: DEFAULT_MODEL)
  *   --no-stream   wait for the full response instead of streaming
- *   --no-markdown disable colored Markdown rendering
+ *   --no-markdown stream plain text only; skip the Markdown re-render
+ *
+ * In an interactive terminal the reply streams in as plain text for
+ * responsiveness, then — once complete — the streamed text is erased in
+ * place and re-rendered with Markdown/ANSI styling.
  *
  * Interactive commands:
  *   /rename NAME  rename the current conversation
- *   /markdown     toggle Markdown rendering
  *   /quit         end the session
  *
  * Conversations are stored in conversations/<name>.jsonl, one
@@ -25,6 +28,9 @@
 #include <string.h>
 #include <time.h>
 #include <locale.h>
+#include <wchar.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 #include "api.h"
 #include "buffer.h"
@@ -56,11 +62,11 @@ static void usage(const char *prog)
         "  -m model     model id (default: %s)\n"
         "  -c name      persist to conversations/<name>.jsonl\n"
         "  --no-stream  wait for the full response instead of streaming\n"
-        "  --no-markdown  disable colored Markdown in the interactive REPL\n"
+        "  --no-markdown  stream plain text only; skip the Markdown re-render\n"
         "\n"
-        "With no prompt, an interactive chat session starts.\n"
+        "With no prompt, an interactive chat session starts. In a terminal the\n"
+        "reply streams in as plain text, then re-renders with Markdown styling.\n"
         "In the chat, /rename NAME renames the conversation.\n"
-        "/markdown [on|off] toggles Markdown rendering.\n"
         "/quit (or Ctrl-D) ends the session.\n",
         prog, DEFAULT_MODEL);
 }
@@ -130,10 +136,76 @@ static void print_you_prompt(bool markdown)
     fflush(stdout);
 }
 
+/* Number of terminal columns; falls back to a conventional 80. */
+static int term_width(void)
+{
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+
+/*
+ * Count the terminal rows `text` occupies when printed from column 0 into
+ * a `width`-column terminal. Accounts for explicit newlines, tab stops,
+ * and East-Asian/emoji cell widths, and models the common "deferred wrap"
+ * behavior (a row filled to exactly `width` does not advance until the
+ * next glyph prints). Used to walk the cursor back over just-streamed
+ * output before it is re-rendered.
+ */
+static int display_rows(const char *text, int width)
+{
+    if (width < 1)
+        width = 80;
+
+    int rows = 1;
+    int col = 0;
+    mbstate_t state;
+    memset(&state, 0, sizeof state);
+
+    for (const char *p = text; *p; ) {
+        if (*p == '\n') {
+            rows++;
+            col = 0;
+            p++;
+            memset(&state, 0, sizeof state);
+            continue;
+        }
+
+        wchar_t wc;
+        size_t n = mbrtowc(&wc, p, MB_CUR_MAX, &state);
+        int cells;
+        if (n == (size_t)-1 || n == (size_t)-2) {
+            memset(&state, 0, sizeof state);
+            n = 1;
+            cells = 1;              /* show the stray byte, width 1 */
+        } else if (n == 0) {
+            break;
+        } else if (wc == L'\t') {
+            cells = 8 - (col % 8);  /* advance to the next tab stop */
+        } else {
+            cells = wcwidth(wc);
+            if (cells < 0)
+                cells = 0;          /* control chars occupy no cell */
+        }
+
+        if (cells > 0 && col + cells > width) {
+            rows++;                 /* the glyph wraps to a new row */
+            col = 0;
+        }
+        col += cells;
+        p += n;
+    }
+    return rows;
+}
+
 /*
  * Run one exchange: append the user message to the in-memory history
  * (and file, if any), call the API with the full history, then record
  * the assistant's reply. Returns 0 on success, -1 on failure.
+ *
+ * In an interactive color terminal the reply streams in as plain text,
+ * then the streamed rows are erased and re-rendered with Markdown styling.
  */
 static int run_turn(const OrRequest *base, Buffer *items,
                     const char *path, const char *user_msg)
@@ -157,8 +229,19 @@ static int run_turn(const OrRequest *base, Buffer *items,
 
     OrRequest req = *base;
     req.messages_json = msgs.data;
-    if (req.markdown)
-        req.quiet = 1; /* render the complete Markdown reply below */
+
+    /* render == re-render the finished reply with Markdown styling.
+     * base->markdown is already gated to an interactive color terminal.
+     * When streaming, the plain tokens are shown live and then reflowed;
+     * without streaming there is nothing live, so suppress or_chat's own
+     * plain print and render the buffered reply instead. */
+    bool render = req.markdown;
+    bool live   = render && req.stream;
+    if (render && !req.stream)
+        req.quiet = 1;
+
+    if (render)
+        print_assistant_banner();
 
     char *reply = nullptr;
     int rc = or_chat(&req, &reply);
@@ -166,8 +249,16 @@ static int run_turn(const OrRequest *base, Buffer *items,
     if (rc != 0)
         return -1;
 
-    if (req.markdown) {
-        print_assistant_banner();
+    if (render) {
+        if (live) {
+            /* or_chat streamed the plain reply plus a trailing newline
+             * directly below the banner. Walk the cursor up over every
+             * streamed row and the banner, clear to end of screen, and
+             * redraw the banner (so an off-by-one can never eat it). */
+            int rows = display_rows(reply, term_width());
+            printf("\033[%dA\r\033[0J", rows + 1);
+            print_assistant_banner();
+        }
         md_render(reply, md_color_enabled());
     }
 
@@ -226,43 +317,13 @@ static void handle_rename(char *args, char *path, size_t pathsz)
     printf("Conversation renamed to %s\n", path);
 }
 
-/*
- * Handle the /markdown command. `args` points just past "/markdown".
- * Updates base->markdown when the toggle succeeds.
- */
-static void handle_markdown(char *args, OrRequest *base)
-{
-    char *value = skip_ws(args);
-
-    bool enabled;
-    if (!*value)
-        enabled = !base->markdown;
-    else if (strcmp(value, "on") == 0)
-        enabled = true;
-    else if (strcmp(value, "off") == 0)
-        enabled = false;
-    else {
-        fprintf(stderr, "usage: /markdown [on|off]\n");
-        return;
-    }
-
-    if (enabled && !md_stdout_is_tty()) {
-        fprintf(stderr, "error: Markdown rendering requires a terminal\n");
-        return;
-    }
-    base->markdown = enabled;
-    printf("Markdown rendering %s%s.\n",
-           enabled ? "enabled" : "disabled",
-           enabled ? " (responses will be buffered)" : "");
-}
-
 /* Print the session header, and prior history when resuming. */
 static int repl_intro(const OrRequest *base, const Buffer *items,
                       const char *path)
 {
     printf("Chatting with %s — /quit or Ctrl-D to exit.\n", base->model);
-    printf("Markdown: %s%s\n", base->markdown ? "on" : "off",
-           base->markdown ? " (responses render after completion)" : "");
+    printf("Markdown: %s\n", base->markdown
+           ? "on (streamed live, then formatted)" : "off");
     if (path) {
         printf("Conversation: %s\n", path);
         if (items->len) {
@@ -301,10 +362,6 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
             break;
         if (is_command(line, "/rename", 7)) {
             handle_rename(line + 7, path, pathsz);
-            continue;
-        }
-        if (is_command(line, "/markdown", 9)) {
-            handle_markdown(line + 9, base);
             continue;
         }
 
@@ -403,7 +460,7 @@ int main(int argc, char **argv)
         .stream   = opts.stream,
         .quiet    = 0,
         .spinner  = opts.prompt ? 0 : 1,
-        .markdown = opts.markdown && !opts.prompt && md_stdout_is_tty(),
+        .markdown = opts.markdown && !opts.prompt && md_color_enabled(),
     };
 
     int status;
