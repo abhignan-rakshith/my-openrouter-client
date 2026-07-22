@@ -12,10 +12,10 @@
  *   --no-stream   wait for the full response instead of streaming
  *   --no-markdown stream plain text only; skip the Markdown re-render
  *
- * In an interactive terminal the reply streams in as plain text on the
- * alternate screen for responsiveness, then — once complete — that view
- * is dropped and the reply is re-rendered on the main screen with
- * Markdown/ANSI styling, so only the formatted copy remains.
+ * In an interactive terminal the reply streams onto the alternate screen,
+ * rendered live as Markdown as it arrives; once complete that view is
+ * dropped and the finished reply is drawn once on the main screen, so
+ * only the final formatted copy remains in the scrollback.
  *
  * Interactive commands:
  *   /rename NAME  rename the current conversation
@@ -142,6 +142,38 @@ static void print_you_prompt(bool markdown)
 static void alt_screen_enter(void) { fputs("\033[?1049h\033[H", stdout); fflush(stdout); }
 static void alt_screen_leave(void) { fputs("\033[?1049l", stdout); fflush(stdout); }
 
+/* Throttle state for the live streaming re-render. */
+typedef struct { struct timespec last; bool started; } StreamPaint;
+
+/*
+ * or_chat progress callback: repaint the alternate screen with the reply
+ * rendered as Markdown so far. Throttled to ~60ms so a fast token stream
+ * doesn't thrash the terminal; the cursor is homed before each frame and
+ * the area below it cleared, so every repaint overwrites the last in place.
+ * Partial constructs (an unclosed **bold**, a half-finished list) simply
+ * settle as more text arrives — the nature of rendering Markdown live.
+ */
+static void stream_repaint(const char *reply, void *user)
+{
+    StreamPaint *sp = user;
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    if (sp->started) {
+        long ms = (now.tv_sec - sp->last.tv_sec) * 1000
+                + (now.tv_nsec - sp->last.tv_nsec) / 1000000;
+        if (ms < 60)
+            return;                     /* too soon: skip this frame */
+    }
+    sp->last = now;
+    sp->started = true;
+
+    fputs("\033[H", stdout);            /* home to top-left of alt screen */
+    print_assistant_banner();
+    md_render(reply, md_color_enabled());
+    fputs("\033[0J", stdout);           /* clear any taller previous frame */
+    fflush(stdout);
+}
+
 /*
  * Run one exchange: append the user message to the in-memory history
  * (and file, if any), call the API with the full history, then record
@@ -185,11 +217,15 @@ static int run_turn(const OrRequest *base, Buffer *items,
     if (render && !req.stream)
         req.quiet = 1;
 
+    StreamPaint paint = {0};
     if (live) {
-        /* Stream into the alternate screen; a transient banner heads it. */
+        /* Stream into the alternate screen, rendered live as Markdown; a
+         * transient banner heads it until the first repaint. */
         alt_screen_enter();
         print_assistant_banner();
         fflush(stdout);
+        req.on_update = stream_repaint;
+        req.on_update_user = &paint;
     }
 
     char *reply = nullptr;
@@ -268,7 +304,7 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
 {
     printf("Chatting with %s — /quit or Ctrl-D to exit.\n", base->model);
     printf("Markdown: %s\n", base->markdown
-           ? "on (streamed live, then formatted)" : "off");
+           ? "on (rendered live as it streams)" : "off");
     if (path) {
         printf("Conversation: %s\n", path);
         if (items->len) {

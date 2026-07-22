@@ -11,6 +11,15 @@
 
 #define ORC_API_URL "https://openrouter.ai/api/v1/chat/completions"
 
+/*
+ * Streaming progress callback. Invoked during an SSE stream each time new
+ * assistant content arrives, with the full reply accumulated so far (a
+ * NUL-terminated string owned by the transport — do not free or retain
+ * it). Lets the caller render the reply live; when set it takes over
+ * display, so or_chat prints nothing itself.
+ */
+typedef void (*OrStreamCb)(const char *reply, void *user);
+
 typedef struct {
     const char *api_key;       /* bearer token                        */
     const char *model;         /* model id                            */
@@ -19,6 +28,8 @@ typedef struct {
     int         quiet;         /* 1 = don't print (caller will)       */
     int         spinner;       /* 1 = terminal spinner while waiting  */
     int         markdown;      /* 1 = caller renders completed reply  */
+    OrStreamCb  on_update;     /* live-render callback, or NULL       */
+    void       *on_update_user;/* opaque arg passed to on_update      */
 } OrRequest;
 
 /*

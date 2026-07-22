@@ -40,13 +40,15 @@ static size_t collect_cb(char *ptr, size_t size, size_t nmemb, void *ud)
  * the transfer; `reply` accumulates the assistant text for the caller.
  */
 typedef struct {
-    Buffer   line;
-    Buffer   raw;
-    Buffer   reply;
-    Spinner *spinner;  /* cleared as soon as content starts arriving */
-    bool     printing; /* echo tokens to stdout as they arrive       */
-    bool     got_error;/* saw an in-stream error event               */
-    bool     oom;      /* allocation failure mid-stream              */
+    Buffer     line;
+    Buffer     raw;
+    Buffer     reply;
+    Spinner   *spinner;   /* cleared as soon as content starts arriving */
+    bool       printing;  /* echo tokens to stdout as they arrive       */
+    bool       got_error; /* saw an in-stream error event               */
+    bool       oom;       /* allocation failure mid-stream              */
+    OrStreamCb on_update; /* live-render callback, or NULL              */
+    void      *on_update_user;
 } StreamState;
 
 static void stream_stop_spinner(StreamState *st)
@@ -69,16 +71,20 @@ static void sse_line(StreamState *st, const char *line)
 
     char *piece = extract_delta(data);
     if (piece) {
-        /* First visible token: clear the spinner, then echo. (In quiet
-         * or buffered-Markdown mode `printing` is false and the spinner
-         * keeps running until the transfer completes.) */
-        if (st->printing) {
+        if (buf_append_str(&st->reply, piece) != 0)
+            st->oom = true;
+        /* First visible content clears the spinner. A live-render callback
+         * takes over display (fed the whole reply so far); otherwise, when
+         * printing, echo just the new token. In quiet/buffered mode both
+         * are off and the spinner runs until the transfer completes. */
+        if (!st->oom && st->on_update) {
+            stream_stop_spinner(st);
+            st->on_update(st->reply.data, st->on_update_user);
+        } else if (!st->oom && st->printing) {
             stream_stop_spinner(st);
             fputs(piece, stdout);
             fflush(stdout);
         }
-        if (buf_append_str(&st->reply, piece) != 0)
-            st->oom = true;
         free(piece);
         return;
     }
@@ -212,7 +218,10 @@ int or_chat(const OrRequest *req, char **reply)
 
     Buffer      resp = {0};
     StreamState st   = {0};
-    st.printing = req->stream && !req->quiet;
+    st.on_update = req->on_update;
+    st.on_update_user = req->on_update_user;
+    /* The callback owns display when present, so plain echo is off then. */
+    st.printing = req->stream && !req->quiet && !st.on_update;
     Spinner *spinner = req->spinner ? spinner_start("Thinking") : nullptr;
     if (req->stream)
         st.spinner = spinner;
