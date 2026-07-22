@@ -5,6 +5,11 @@ CFLAGS  += -D_POSIX_C_SOURCE=200809L -pthread \
 LDFLAGS += -pthread
 LDLIBS   = $(shell pkg-config --libs libcurl libcmark)
 
+# `make install` symlinks the built binary into PREFIX/bin, so a plain
+# `make` rebuild is picked up everywhere without reinstalling.
+PREFIX  ?= $(HOME)/.local
+BINDIR  := $(PREFIX)/bin
+
 SRC := src/main.c src/api.c src/conv.c src/jsonutil.c src/config.c src/buffer.c \
        src/spinner.c src/md.c src/userconfig.c
 OBJ := $(SRC:.c=.o)
@@ -19,4 +24,13 @@ src/%.o: src/%.c $(HDR)
 clean:
 	rm -f orc $(OBJ)
 
-.PHONY: clean
+# Symlink (not copy) so rebuilds are reflected without reinstalling.
+install: orc
+	@mkdir -p $(BINDIR)
+	ln -sf $(abspath orc) $(BINDIR)/orc
+	@echo "linked $(BINDIR)/orc -> $(abspath orc)"
+
+uninstall:
+	rm -f $(BINDIR)/orc
+
+.PHONY: clean install uninstall
