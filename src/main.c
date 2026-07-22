@@ -29,6 +29,8 @@
 #include <string.h>
 #include <time.h>
 #include <locale.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "api.h"
 #include "buffer.h"
@@ -139,8 +141,51 @@ static void print_you_prompt(bool markdown)
  * on exit and the original screen is restored — no matter how long the
  * reply was. This is how the live plain stream is shown and then discarded
  * before the formatted reply is drawn on the main screen. */
-static void alt_screen_enter(void) { fputs("\033[?1049h\033[H", stdout); fflush(stdout); }
-static void alt_screen_leave(void) { fputs("\033[?1049l", stdout); fflush(stdout); }
+/* Set while the alternate screen is active, so a fatal signal can restore
+ * the main screen before the process dies. sig_atomic_t for handler safety. */
+static volatile sig_atomic_t g_in_alt_screen = 0;
+
+static void alt_screen_enter(void)
+{
+    fputs("\033[?1049h\033[H", stdout);
+    fflush(stdout);
+    g_in_alt_screen = 1;        /* mark only once the enter is on the wire */
+}
+
+static void alt_screen_leave(void)
+{
+    fputs("\033[?1049l", stdout);
+    fflush(stdout);
+    g_in_alt_screen = 0;        /* clear only after the leave is on the wire */
+}
+
+/*
+ * Async-signal-safe handler for Ctrl-C and friends: if we were streaming on
+ * the alternate screen, restore the main screen (a lone write(2) is safe in
+ * a handler) so the terminal is never left stranded. Then re-raise with the
+ * default disposition so the exit status still reflects the signal.
+ */
+static void on_fatal_signal(int sig)
+{
+    if (g_in_alt_screen) {
+        ssize_t r = write(STDOUT_FILENO, "\033[?1049l", 8);
+        (void)r;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Install on_fatal_signal for the signals that would otherwise kill us
+ * mid-stream and leave the terminal on the alternate screen. */
+static void install_signal_handlers(void)
+{
+    struct sigaction sa = { .sa_handler = on_fatal_signal };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+}
 
 /* Throttle state for the live streaming re-render. */
 typedef struct { struct timespec last; bool started; } StreamPaint;
@@ -402,6 +447,9 @@ int main(int argc, char **argv)
     /* Required for terminal cell-width calculations (emoji, CJK,
      * combining marks) used by the Markdown table renderer. */
     setlocale(LC_CTYPE, "");
+
+    /* Restore the terminal if a signal interrupts alternate-screen streaming. */
+    install_signal_handlers();
 
     Options opts;
     int exit_code = 0;
