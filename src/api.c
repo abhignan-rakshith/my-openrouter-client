@@ -1,5 +1,11 @@
 /*
  * api.c — OpenRouter chat completions transport (libcurl + SSE).
+ *
+ * Two request shapes share one code path:
+ *   - single-shot: collect the whole body, then extract the content;
+ *   - streaming (SSE): reassemble `data:` lines as they arrive, echo
+ *     assistant tokens to stdout, and accumulate the full reply.
+ * Every exit frees the curl handle, the header slist, and all buffers.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +17,9 @@
 #include "jsonutil.h"
 #include "spinner.h"
 
+/* Overall transfer deadline, in seconds. */
+constexpr long ORC_TIMEOUT_SECS = 300;
+
 /* ------------------------------------------------------------------ */
 /* curl write callbacks                                                */
 /* ------------------------------------------------------------------ */
@@ -20,9 +29,8 @@ static size_t collect_cb(char *ptr, size_t size, size_t nmemb, void *ud)
 {
     Buffer *b = ud;
     size_t n = size * nmemb;
-    if (buf_append(b, ptr, n) != 0)
-        return 0; /* returning short signals failure to curl */
-    return n;
+    /* Returning a short count is how a write callback signals failure. */
+    return buf_append(b, ptr, n) == 0 ? n : 0;
 }
 
 /*
@@ -32,22 +40,22 @@ static size_t collect_cb(char *ptr, size_t size, size_t nmemb, void *ud)
  * the transfer; `reply` accumulates the assistant text for the caller.
  */
 typedef struct {
-    Buffer line;
-    Buffer raw;
-    Buffer reply;
-    Spinner *spinner; /* cleared as soon as content starts arriving */
-    int    printing;  /* echo tokens to stdout as they arrive */
-    int    got_error; /* saw an in-stream error event         */
-    int    oom;       /* allocation failure mid-stream        */
+    Buffer   line;
+    Buffer   raw;
+    Buffer   reply;
+    Spinner *spinner;  /* cleared as soon as content starts arriving */
+    bool     printing; /* echo tokens to stdout as they arrive       */
+    bool     got_error;/* saw an in-stream error event               */
+    bool     oom;      /* allocation failure mid-stream              */
 } StreamState;
 
 static void stream_stop_spinner(StreamState *st)
 {
     spinner_stop(st->spinner);
-    st->spinner = NULL;
+    st->spinner = nullptr;
 }
 
-/* Handle one complete SSE line. */
+/* Handle one complete, NUL-terminated SSE line. */
 static void sse_line(StreamState *st, const char *line)
 {
     /* Ignore comment lines (": OPENROUTER PROCESSING") and blanks. */
@@ -61,16 +69,16 @@ static void sse_line(StreamState *st, const char *line)
 
     char *piece = extract_delta(data);
     if (piece) {
-        /* Buffered Markdown keeps spinning until the full response;
-         * live text clears the spinner before its first token. */
-        if (st->printing)
-            stream_stop_spinner(st);
+        /* First visible token: clear the spinner, then echo. (In quiet
+         * or buffered-Markdown mode `printing` is false and the spinner
+         * keeps running until the transfer completes.) */
         if (st->printing) {
+            stream_stop_spinner(st);
             fputs(piece, stdout);
             fflush(stdout);
         }
         if (buf_append_str(&st->reply, piece) != 0)
-            st->oom = 1;
+            st->oom = true;
         free(piece);
         return;
     }
@@ -83,7 +91,7 @@ static void sse_line(StreamState *st, const char *line)
         if (st->printing && st->reply.len)
             fputc('\n', stdout);
         fprintf(stderr, "error: %s\n", err);
-        st->got_error = 1;
+        st->got_error = true;
         free(err);
     }
 }
@@ -93,23 +101,24 @@ static size_t sse_cb(char *ptr, size_t size, size_t nmemb, void *ud)
     StreamState *st = ud;
     size_t n = size * nmemb;
     if (buf_append(&st->raw, ptr, n) != 0 ||
-        buf_append(&st->line, ptr, n) != 0)
+        buf_append(&st->line, ptr, n) != 0) {
+        st->oom = true;
         return 0;
+    }
 
-    /* Dispatch every complete line in the accumulator. */
-    char *start = st->line.data;
-    char *nl;
-    while ((nl = memchr(start, '\n', st->line.len -
-                        (size_t)(start - st->line.data))) != NULL) {
+    /* Dispatch every complete line in the accumulator, splitting on
+     * '\n' and trimming a trailing '\r'. */
+    char  *start = st->line.data;
+    char  *end   = st->line.data + st->line.len;
+    for (char *nl; (nl = memchr(start, '\n', (size_t)(end - start))); start = nl + 1) {
         *nl = '\0';
         if (nl > start && nl[-1] == '\r')
             nl[-1] = '\0';
         sse_line(st, start);
-        start = nl + 1;
     }
 
     /* Keep the unfinished tail for the next callback. */
-    size_t rest = st->line.len - (size_t)(start - st->line.data);
+    size_t rest = (size_t)(end - start);
     memmove(st->line.data, start, rest);
     st->line.len = rest;
     st->line.data[rest] = '\0';
@@ -121,10 +130,10 @@ static size_t sse_cb(char *ptr, size_t size, size_t nmemb, void *ud)
 /* Request                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Report an error payload (JSON if parseable, raw otherwise). */
+/* Report an error payload (JSON message if parseable, raw otherwise). */
 static void report_http_error(long status, const char *body)
 {
-    char *err = body ? extract_error(body) : NULL;
+    char *err = body ? extract_error(body) : nullptr;
     if (err) {
         fprintf(stderr, "error (HTTP %ld): %s\n", status, err);
         free(err);
@@ -134,29 +143,40 @@ static void report_http_error(long status, const char *body)
     }
 }
 
-int or_chat(const OrRequest *req, char **reply)
+/*
+ * Build the JSON request body into *out.
+ * Returns 0 on success, -1 on allocation failure (out is freed).
+ */
+static int build_body(const OrRequest *req, Buffer *out)
 {
-    *reply = NULL;
-
-    /* Assemble the request body. */
     char *esc_model = json_escape(req->model);
-    if (!esc_model) {
-        fprintf(stderr, "error: out of memory\n");
+    if (!esc_model)
+        return -1;
+
+    bool bad = buf_append_str(out, "{\"model\":\"") ||
+               buf_append_str(out, esc_model)       ||
+               buf_append_str(out, "\",")           ||
+               (req->stream &&
+                buf_append_str(out, "\"stream\":true,")) ||
+               buf_append_str(out, "\"messages\":")      ||
+               buf_append_str(out, req->messages_json)   ||
+               buf_append_str(out, "}");
+    free(esc_model);
+
+    if (bad) {
+        buf_free(out);
         return -1;
     }
+    return 0;
+}
+
+int or_chat(const OrRequest *req, char **reply)
+{
+    *reply = nullptr;
+
     Buffer body = {0};
-    int bad = buf_append_str(&body, "{\"model\":\"") ||
-              buf_append_str(&body, esc_model)      ||
-              buf_append_str(&body, "\",")          ||
-              (req->stream &&
-               buf_append_str(&body, "\"stream\":true,")) ||
-              buf_append_str(&body, "\"messages\":")      ||
-              buf_append_str(&body, req->messages_json)   ||
-              buf_append_str(&body, "}");
-    free(esc_model);
-    if (bad) {
+    if (build_body(req, &body) != 0) {
         fprintf(stderr, "error: out of memory\n");
-        buf_free(&body);
         return -1;
     }
 
@@ -177,28 +197,34 @@ int or_chat(const OrRequest *req, char **reply)
         return -1;
     }
 
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, auth_header);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    if (!headers) {
+    struct curl_slist *headers = curl_slist_append(nullptr, auth_header);
+    struct curl_slist *ct = headers
+        ? curl_slist_append(headers, "Content-Type: application/json")
+        : nullptr;
+    if (!ct) {
         fprintf(stderr, "error: out of memory\n");
+        curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         buf_free(&body);
         return -1;
     }
+    headers = ct;
 
-    Buffer resp = {0};
-    StreamState st = {0};
+    Buffer      resp = {0};
+    StreamState st   = {0};
     st.printing = req->stream && !req->quiet;
-    Spinner *spinner = req->spinner ? spinner_start("Thinking") : NULL;
+    Spinner *spinner = req->spinner ? spinner_start("Thinking") : nullptr;
     if (req->stream)
         st.spinner = spinner;
 
     curl_easy_setopt(curl, CURLOPT_URL, ORC_API_URL);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, ORC_TIMEOUT_SECS);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "orc/0.2 (native C)");
+    /* The spinner runs in a second thread; disable curl's use of signals
+     * so its timeout handling stays thread-safe. */
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     if (req->stream) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sse_cb);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &st);
@@ -208,10 +234,13 @@ int or_chat(const OrRequest *req, char **reply)
     }
 
     CURLcode rc = curl_easy_perform(curl);
+
+    /* Stop whichever spinner is still live before touching stdout/stderr. */
     if (req->stream)
         stream_stop_spinner(&st);
     else
         spinner_stop(spinner);
+
     long http_status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
     curl_slist_free_all(headers);
@@ -229,19 +258,19 @@ int or_chat(const OrRequest *req, char **reply)
             if (st.printing)
                 fputc('\n', stdout);
             *reply = st.reply.data; /* transfer ownership */
-            st.reply.data = NULL;
+            st.reply.data = nullptr;
             result = 0;
         } else if (!st.got_error) {
-            /* Nothing streamed and no SSE error: the server most
-             * likely replied with a plain JSON error body. */
+            /* Nothing streamed and no SSE error: the server most likely
+             * replied with a plain JSON error body. */
             report_http_error(http_status, st.raw.data);
         }
     } else {
-        char *content = resp.data ? extract_content(resp.data) : NULL;
+        char *content = resp.data ? extract_content(resp.data) : nullptr;
         if (content) {
             if (!req->quiet)
                 printf("%s\n", content);
-            *reply = content;
+            *reply = content; /* transfer ownership */
             result = 0;
         } else {
             report_http_error(http_status, resp.data);

@@ -34,6 +34,20 @@
 
 #define DEFAULT_MODEL "google/gemini-3.6-flash"
 
+/* Longest conversation on-disk path we build (matches conv module scope). */
+constexpr size_t PATH_CAP = 512;
+/* Longest auto-generated conversation name (chat-YYYYMMDD-HHMMSS + slack). */
+constexpr size_t NAME_CAP = 64;
+
+/* Parsed command-line options. */
+typedef struct {
+    const char *model;
+    const char *prompt;     /* nullptr => interactive session */
+    const char *conv_name;  /* nullptr => no explicit -c name  */
+    bool        stream;
+    bool        markdown;
+} Options;
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -52,9 +66,74 @@ static void usage(const char *prog)
 }
 
 /*
+ * Parse argv into *opts. Returns true if main should continue; returns
+ * false when it should exit immediately, storing the exit code in
+ * *exit_code (0 for --help, 1 for a usage error).
+ */
+static bool parse_args(int argc, char **argv, Options *opts, int *exit_code)
+{
+    *opts = (Options){
+        .model    = DEFAULT_MODEL,
+        .prompt   = nullptr,
+        .conv_name = nullptr,
+        .stream   = true,
+        .markdown = true,
+    };
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "-m") == 0 && i + 1 < argc) {
+            opts->model = argv[++i];
+        } else if (strcmp(arg, "-c") == 0 && i + 1 < argc) {
+            opts->conv_name = argv[++i];
+        } else if (strcmp(arg, "--no-stream") == 0) {
+            opts->stream = false;
+        } else if (strcmp(arg, "--no-markdown") == 0) {
+            opts->markdown = false;
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            usage(argv[0]);
+            *exit_code = 0;
+            return false;
+        } else if (arg[0] == '-') {
+            fprintf(stderr, "error: unknown option '%s'\n", arg);
+            usage(argv[0]);
+            *exit_code = 1;
+            return false;
+        } else if (!opts->prompt) {
+            opts->prompt = arg;
+        } else {
+            fprintf(stderr, "error: multiple prompts given\n");
+            usage(argv[0]);
+            *exit_code = 1;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Print the "assistant>" banner shown before a rendered Markdown reply. */
+static void print_assistant_banner(void)
+{
+    if (md_color_enabled())
+        fputs("\033[1;38;5;141massistant>\033[0m\n", stdout);
+    else
+        fputs("assistant>\n", stdout);
+}
+
+/* Print the interactive "you>" prompt. */
+static void print_you_prompt(bool markdown)
+{
+    if (markdown && md_color_enabled())
+        fputs("\n\033[1;38;5;84myou>\033[0m ", stdout);
+    else
+        fputs("\nyou> ", stdout);
+    fflush(stdout);
+}
+
+/*
  * Run one exchange: append the user message to the in-memory history
  * (and file, if any), call the API with the full history, then record
- * the assistant's reply. Returns 0 on success.
+ * the assistant's reply. Returns 0 on success, -1 on failure.
  */
 static int run_turn(const OrRequest *base, Buffer *items,
                     const char *path, const char *user_msg)
@@ -68,8 +147,8 @@ static int run_turn(const OrRequest *base, Buffer *items,
 
     /* Wrap the accumulated items in a JSON array. */
     Buffer msgs = {0};
-    if (buf_append_str(&msgs, "[")          ||
-        buf_append_str(&msgs, items->data)  ||
+    if (buf_append_str(&msgs, "[")         ||
+        buf_append_str(&msgs, items->data) ||
         buf_append_str(&msgs, "]")) {
         fprintf(stderr, "error: out of memory\n");
         buf_free(&msgs);
@@ -81,17 +160,14 @@ static int run_turn(const OrRequest *base, Buffer *items,
     if (req.markdown)
         req.quiet = 1; /* render the complete Markdown reply below */
 
-    char *reply = NULL;
+    char *reply = nullptr;
     int rc = or_chat(&req, &reply);
     buf_free(&msgs);
     if (rc != 0)
         return -1;
 
     if (req.markdown) {
-        if (md_color_enabled())
-            fputs("\033[1;38;5;141massistant>\033[0m\n", stdout);
-        else
-            fputs("assistant>\n", stdout);
+        print_assistant_banner();
         md_render(reply, md_color_enabled());
     }
 
@@ -106,9 +182,83 @@ static int run_turn(const OrRequest *base, Buffer *items,
     return rc;
 }
 
-/* Interactive read–send–print loop. */
-static int repl(OrRequest *base, Buffer *items,
-                char *path, size_t pathsz)
+/* True if `line` is `cmd`, optionally followed by whitespace + args. */
+static bool is_command(const char *line, const char *cmd, size_t cmd_len)
+{
+    return strncmp(line, cmd, cmd_len) == 0 &&
+           (line[cmd_len] == '\0' || line[cmd_len] == ' ' ||
+            line[cmd_len] == '\t');
+}
+
+/* Skip leading spaces and tabs. */
+static char *skip_ws(char *s)
+{
+    while (*s == ' ' || *s == '\t')
+        s++;
+    return s;
+}
+
+/*
+ * Handle the /rename command. `args` points just past "/rename".
+ * On success updates *path in place (buffer of pathsz bytes).
+ */
+static void handle_rename(char *args, char *path, size_t pathsz)
+{
+    char *name = skip_ws(args);
+    if (!*name) {
+        fprintf(stderr, "usage: /rename NAME\n");
+        return;
+    }
+
+    char newpath[PATH_CAP];
+    if (!path || conv_path(name, newpath, sizeof newpath) != 0) {
+        fprintf(stderr, "error: invalid conversation name '%s'\n", name);
+        return;
+    }
+    if (strlen(newpath) + 1 > pathsz) {
+        fprintf(stderr, "error: conversation name is too long\n");
+        return;
+    }
+    if (conv_rename(path, newpath) != 0)
+        return;
+
+    memcpy(path, newpath, strlen(newpath) + 1);
+    printf("Conversation renamed to %s\n", path);
+}
+
+/*
+ * Handle the /markdown command. `args` points just past "/markdown".
+ * Updates base->markdown when the toggle succeeds.
+ */
+static void handle_markdown(char *args, OrRequest *base)
+{
+    char *value = skip_ws(args);
+
+    bool enabled;
+    if (!*value)
+        enabled = !base->markdown;
+    else if (strcmp(value, "on") == 0)
+        enabled = true;
+    else if (strcmp(value, "off") == 0)
+        enabled = false;
+    else {
+        fprintf(stderr, "usage: /markdown [on|off]\n");
+        return;
+    }
+
+    if (enabled && !md_stdout_is_tty()) {
+        fprintf(stderr, "error: Markdown rendering requires a terminal\n");
+        return;
+    }
+    base->markdown = enabled;
+    printf("Markdown rendering %s%s.\n",
+           enabled ? "enabled" : "disabled",
+           enabled ? " (responses will be buffered)" : "");
+}
+
+/* Print the session header, and prior history when resuming. */
+static int repl_intro(const OrRequest *base, const Buffer *items,
+                      const char *path)
 {
     printf("Chatting with %s — /quit or Ctrl-D to exit.\n", base->model);
     printf("Markdown: %s%s\n", base->markdown ? "on" : "off",
@@ -122,16 +272,21 @@ static int repl(OrRequest *base, Buffer *items,
             printf("\n--- Resuming chat ---\n");
         }
     }
+    return 0;
+}
 
-    char *line = NULL;
+/* Interactive read–send–print loop. */
+static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
+{
+    if (repl_intro(base, items, path) != 0)
+        return 1;
+
+    char *line = nullptr;
     size_t cap = 0;
     int status = 0;
     for (;;) {
-        if (base->markdown && md_color_enabled())
-            fputs("\n\033[1;38;5;84myou>\033[0m ", stdout);
-        else
-            fputs("\nyou> ", stdout);
-        fflush(stdout);
+        print_you_prompt(base->markdown);
+
         ssize_t n = getline(&line, &cap, stdin);
         if (n == -1) { /* EOF */
             putchar('\n');
@@ -141,60 +296,15 @@ static int repl(OrRequest *base, Buffer *items,
             line[--n] = '\0';
         if (n == 0)
             continue;
+
         if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0)
             break;
-        if (strncmp(line, "/rename", 7) == 0 &&
-            (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
-            char *name = line + 7;
-            while (*name == ' ' || *name == '\t')
-                name++;
-            if (!*name) {
-                fprintf(stderr, "usage: /rename NAME\n");
-                continue;
-            }
-            char newpath[512];
-            if (!path || conv_path(name, newpath, sizeof newpath) != 0) {
-                fprintf(stderr,
-                        "error: invalid conversation name '%s'\n", name);
-                continue;
-            }
-            if (strlen(newpath) + 1 > pathsz) {
-                fprintf(stderr, "error: conversation name is too long\n");
-                continue;
-            }
-            if (conv_rename(path, newpath) != 0)
-                continue;
-            strcpy(path, newpath);
-            printf("Conversation renamed to %s\n", path);
+        if (is_command(line, "/rename", 7)) {
+            handle_rename(line + 7, path, pathsz);
             continue;
         }
-        if (strncmp(line, "/markdown", 9) == 0 &&
-            (line[9] == '\0' || line[9] == ' ' || line[9] == '\t')) {
-            char *value = line + 9;
-            while (*value == ' ' || *value == '\t')
-                value++;
-
-            int enabled;
-            if (!*value)
-                enabled = !base->markdown;
-            else if (strcmp(value, "on") == 0)
-                enabled = 1;
-            else if (strcmp(value, "off") == 0)
-                enabled = 0;
-            else {
-                fprintf(stderr, "usage: /markdown [on|off]\n");
-                continue;
-            }
-
-            if (enabled && !md_stdout_is_tty()) {
-                fprintf(stderr,
-                        "error: Markdown rendering requires a terminal\n");
-                continue;
-            }
-            base->markdown = enabled;
-            printf("Markdown rendering %s%s.\n",
-                   enabled ? "enabled" : "disabled",
-                   enabled ? " (responses will be buffered)" : "");
+        if (is_command(line, "/markdown", 9)) {
+            handle_markdown(line + 9, base);
             continue;
         }
 
@@ -211,10 +321,42 @@ static int repl(OrRequest *base, Buffer *items,
 /* Generate a timestamp-based conversation name: chat-YYYYMMDD-HHMMSS. */
 static void auto_name(char *out, size_t outsz)
 {
-    time_t now = time(NULL);
+    time_t now = time(nullptr);
     struct tm tm;
     localtime_r(&now, &tm);
     strftime(out, outsz, "chat-%Y%m%d-%H%M%S", &tm);
+}
+
+/*
+ * Resolve the conversation file, if persistence is in play. Interactive
+ * sessions are always persisted (auto-named when the user didn't pick a
+ * name); bare one-shots stay ephemeral. On success stores the resolved
+ * path in `pathbuf` and returns a pointer to it (or nullptr for an
+ * ephemeral one-shot). On error prints a diagnostic and returns nullptr
+ * with *failed set to true.
+ */
+static char *resolve_path(const Options *opts, char *namebuf, size_t namesz,
+                          char *pathbuf, size_t pathsz, bool *failed)
+{
+    *failed = false;
+    const char *conv_name = opts->conv_name;
+    if (!conv_name && !opts->prompt) {
+        auto_name(namebuf, namesz);
+        conv_name = namebuf;
+    }
+    if (!conv_name)
+        return nullptr;
+
+    if (conv_path(conv_name, pathbuf, pathsz) != 0) {
+        fprintf(stderr, "error: invalid conversation name '%s'\n", conv_name);
+        *failed = true;
+        return nullptr;
+    }
+    if (conv_ensure_dir() != 0) {
+        *failed = true;
+        return nullptr;
+    }
+    return pathbuf;
 }
 
 int main(int argc, char **argv)
@@ -223,37 +365,10 @@ int main(int argc, char **argv)
      * combining marks) used by the Markdown table renderer. */
     setlocale(LC_CTYPE, "");
 
-    const char *model = DEFAULT_MODEL;
-    const char *prompt = NULL;
-    const char *conv_name = NULL;
-    int stream = 1;
-    int markdown = 1;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            model = argv[++i];
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            conv_name = argv[++i];
-        } else if (strcmp(argv[i], "--no-stream") == 0) {
-            stream = 0;
-        } else if (strcmp(argv[i], "--no-markdown") == 0) {
-            markdown = 0;
-        } else if (strcmp(argv[i], "-h") == 0 ||
-                   strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
-        } else if (argv[i][0] == '-') {
-            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
-            usage(argv[0]);
-            return 1;
-        } else if (!prompt) {
-            prompt = argv[i];
-        } else {
-            fprintf(stderr, "error: multiple prompts given\n");
-            usage(argv[0]);
-            return 1;
-        }
-    }
+    Options opts;
+    int exit_code = 0;
+    if (!parse_args(argc, argv, &opts, &exit_code))
+        return exit_code;
 
     char *api_key = load_api_key();
     if (!api_key) {
@@ -264,28 +379,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Resolve the conversation file, if persistence is in play.
-     * Interactive sessions are always persisted (auto-named when the
-     * user didn't pick a name); bare one-shots stay ephemeral. */
-    char namebuf[64];
-    char pathbuf[512];
-    char *path = NULL;
-    if (!conv_name && !prompt) {
-        auto_name(namebuf, sizeof namebuf);
-        conv_name = namebuf;
-    }
-    if (conv_name) {
-        if (conv_path(conv_name, pathbuf, sizeof pathbuf) != 0) {
-            fprintf(stderr,
-                    "error: invalid conversation name '%s'\n", conv_name);
-            free(api_key);
-            return 1;
-        }
-        if (conv_ensure_dir() != 0) {
-            free(api_key);
-            return 1;
-        }
-        path = pathbuf;
+    char namebuf[NAME_CAP];
+    char pathbuf[PATH_CAP];
+    bool failed = false;
+    char *path = resolve_path(&opts, namebuf, sizeof namebuf,
+                              pathbuf, sizeof pathbuf, &failed);
+    if (failed) {
+        free(api_key);
+        return 1;
     }
 
     /* Load prior history (empty for new conversations). */
@@ -297,17 +398,17 @@ int main(int argc, char **argv)
     }
 
     OrRequest base = {
-        .api_key = api_key,
-        .model   = model,
-        .stream  = stream,
-        .quiet   = 0,
-        .spinner = prompt ? 0 : 1,
-        .markdown = markdown && !prompt && md_stdout_is_tty(),
+        .api_key  = api_key,
+        .model    = opts.model,
+        .stream   = opts.stream,
+        .quiet    = 0,
+        .spinner  = opts.prompt ? 0 : 1,
+        .markdown = opts.markdown && !opts.prompt && md_stdout_is_tty(),
     };
 
     int status;
-    if (prompt)
-        status = run_turn(&base, &items, path, prompt) ? 1 : 0;
+    if (opts.prompt)
+        status = run_turn(&base, &items, path, opts.prompt) ? 1 : 0;
     else
         status = repl(&base, &items, path, sizeof pathbuf);
 

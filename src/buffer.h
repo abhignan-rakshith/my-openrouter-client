@@ -18,8 +18,11 @@ typedef struct {
 } Buffer;
 
 /*
- * Append n bytes from src. Returns 0 on success, -1 on allocation
- * failure (buffer contents are left intact on failure).
+ * Append n bytes from src. Returns 0 on success, -1 on failure, where
+ * failure means either an allocation error or a size request that would
+ * overflow SIZE_MAX. On failure the buffer contents are left intact.
+ * Passing (NULL, 0) is valid and simply ensures the buffer is
+ * NUL-terminated without appending anything.
  */
 int buf_append(Buffer *b, const char *src, size_t n);
 

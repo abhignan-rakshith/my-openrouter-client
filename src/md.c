@@ -12,7 +12,9 @@
 #include "md.h"
 #include "buffer.h"
 
-enum {
+#define COUNTOF(a) (sizeof(a) / sizeof((a)[0]))
+
+enum : unsigned {
     STYLE_BOLD    = 1u << 0,
     STYLE_ITALIC  = 1u << 1,
     STYLE_DIM     = 1u << 2,
@@ -30,15 +32,15 @@ enum {
 };
 
 typedef struct {
-    int color;
-    int line_start;
-    int wrote_any;
-    int trailing_newlines;
+    int color;                /* mirrors the public `color` argument      */
+    bool line_start;          /* at column 0: indent/quote prefix pending */
+    bool wrote_any;           /* any visible output produced so far       */
+    int trailing_newlines;    /* consecutive '\n' at the tail             */
     int indent;
     int quote_depth;
     int heading_level;
     unsigned style;
-    Buffer *out;   /* when non-NULL, write here instead of stdout */
+    Buffer *out;              /* when non-null, write here instead of stdout */
 } Renderer;
 
 static void out_bytes(const Renderer *r, const char *b, size_t n)
@@ -65,8 +67,43 @@ int md_stdout_is_tty(void)
 
 int md_color_enabled(void)
 {
-    return md_stdout_is_tty() && getenv("NO_COLOR") == NULL;
+    return md_stdout_is_tty() && getenv("NO_COLOR") == nullptr;
 }
+
+/* Per-level heading palette: a terminal cannot change the font size, so
+ * the hierarchy is conveyed by color instead. */
+static const char *heading_sgr(int level)
+{
+    switch (level) {
+    case 1:  return "\033[1;4;38;5;199m"; /* pink   */
+    case 2:  return "\033[1;4;38;5;45m";  /* cyan   */
+    case 3:  return "\033[1;38;5;39m";    /* blue   */
+    case 4:  return "\033[1;38;5;78m";    /* green  */
+    case 5:  return "\033[1;38;5;214m";   /* orange */
+    default: return "\033[1;2;38;5;250m"; /* grey   */
+    }
+}
+
+typedef struct { unsigned mask; const char *sgr; } StyleSGR;
+
+/* Mutually exclusive foreground colors, highest priority first. */
+static const StyleSGR fg_styles[] = {
+    { STYLE_CODE_BLOCK, "\033[38;5;114m" },  /* soft green      */
+    { STYLE_CODE,       "\033[38;5;220m" },  /* warm yellow     */
+    { STYLE_LINK,       "\033[4;38;5;75m" }, /* underlined blue */
+    { STYLE_SUCCESS,    "\033[1;38;5;84m" }, /* green           */
+    { STYLE_WARNING,    "\033[1;38;5;220m" },/* yellow          */
+    { STYLE_ACCENT,     "\033[1;38;5;45m" }, /* cyan            */
+    { STYLE_QUOTE,      "\033[38;5;109m" },  /* muted cyan      */
+};
+
+/* Additive text attributes, applied after any foreground color. */
+static const StyleSGR add_styles[] = {
+    { STYLE_ITALIC,    "\033[3m" },
+    { STYLE_UNDERLINE, "\033[4m" },
+    { STYLE_STRIKE,    "\033[9m" },
+    { STYLE_DIM,       "\033[2m" },
+};
 
 static void emit_style(const Renderer *r)
 {
@@ -74,44 +111,24 @@ static void emit_style(const Renderer *r)
         return;
 
     out_str(r, "\033[0m");
+
     if (r->style & STYLE_HEADING) {
-        /* Per-level palette so the hierarchy is visible even though a
-         * terminal can't change the font size. */
-        switch (r->heading_level) {
-        case 1: out_str(r, "\033[1;4;38;5;199m"); break; /* pink   */
-        case 2: out_str(r, "\033[1;4;38;5;45m");  break; /* cyan   */
-        case 3: out_str(r, "\033[1;38;5;39m");    break; /* blue   */
-        case 4: out_str(r, "\033[1;38;5;78m");    break; /* green  */
-        case 5: out_str(r, "\033[1;38;5;214m");   break; /* orange */
-        default: out_str(r, "\033[1;2;38;5;250m"); break;/* grey   */
-        }
-    } else if (r->style & STYLE_CODE_BLOCK)
-        out_str(r, "\033[38;5;114m");    /* soft green */
-    else if (r->style & STYLE_CODE)
-        out_str(r, "\033[38;5;220m");    /* warm yellow */
-    else if (r->style & STYLE_LINK)
-        out_str(r, "\033[4;38;5;75m");   /* underlined blue */
-    else if (r->style & STYLE_SUCCESS)
-        out_str(r, "\033[1;38;5;84m");   /* green */
-    else if (r->style & STYLE_WARNING)
-        out_str(r, "\033[1;38;5;220m");  /* yellow */
-    else if (r->style & STYLE_ACCENT)
-        out_str(r, "\033[1;38;5;45m");   /* cyan */
-    else if (r->style & STYLE_QUOTE)
-        out_str(r, "\033[38;5;109m");    /* muted cyan */
+        out_str(r, heading_sgr(r->heading_level));
+    } else {
+        for (size_t i = 0; i < COUNTOF(fg_styles); i++)
+            if (r->style & fg_styles[i].mask) {
+                out_str(r, fg_styles[i].sgr);
+                break;
+            }
+    }
 
     if (r->style & STYLE_HIGHLIGHT)
         out_str(r, "\033[48;5;229m\033[38;5;16m"); /* black on cream */
     if ((r->style & STYLE_BOLD) && !(r->style & STYLE_HEADING))
         out_str(r, "\033[1m");
-    if (r->style & STYLE_ITALIC)
-        out_str(r, "\033[3m");
-    if (r->style & STYLE_UNDERLINE)
-        out_str(r, "\033[4m");
-    if (r->style & STYLE_STRIKE)
-        out_str(r, "\033[9m");
-    if (r->style & STYLE_DIM)
-        out_str(r, "\033[2m");
+    for (size_t i = 0; i < COUNTOF(add_styles); i++)
+        if (r->style & add_styles[i].mask)
+            out_str(r, add_styles[i].sgr);
 }
 
 static void set_style(Renderer *r, unsigned style)
@@ -134,21 +151,21 @@ static void start_line(Renderer *r)
     }
     for (int i = 0; i < r->indent; i++)
         out_bytes(r, " ", 1);
-    r->line_start = 0;
+    r->line_start = false;
 }
 
 static void put_char(Renderer *r, char c)
 {
     if (c == '\n') {
         out_bytes(r, "\n", 1);
-        r->line_start = 1;
-        r->wrote_any = 1;
+        r->line_start = true;
+        r->wrote_any = true;
         r->trailing_newlines++;
         return;
     }
     start_line(r);
     out_bytes(r, &c, 1);
-    r->wrote_any = 1;
+    r->wrote_any = true;
     r->trailing_newlines = 0;
 }
 
@@ -189,7 +206,7 @@ static const char *superscript_of(char c)
     case 't': return "ᵗ"; case 'u': return "ᵘ"; case 'v': return "ᵛ";
     case 'w': return "ʷ"; case 'x': return "ˣ"; case 'y': return "ʸ";
     case 'z': return "ᶻ"; case '.': return "·"; case ' ': return " ";
-    default:  return NULL;
+    default:  return nullptr;
     }
 }
 
@@ -207,7 +224,7 @@ static const char *subscript_of(char c)
     case 'o': return "ₒ"; case 'p': return "ₚ"; case 'r': return "ᵣ";
     case 's': return "ₛ"; case 't': return "ₜ"; case 'u': return "ᵤ";
     case 'v': return "ᵥ"; case 'x': return "ₓ"; case ' ': return " ";
-    default:  return NULL;
+    default:  return nullptr;
     }
 }
 
@@ -259,7 +276,7 @@ static const char *find_double(const char *p, char c)
     for (; p[0] && p[1]; p++)
         if (p[0] == c && p[1] == c)
             return p;
-    return NULL;
+    return nullptr;
 }
 
 static size_t autolink_len(const char *p)
@@ -391,7 +408,7 @@ static void render_inline(Renderer *r, cmark_node *node)
         break;
     case CMARK_NODE_CODE:
         /* CODE is a leaf, so render its literal directly. */
-        if ((literal = cmark_node_get_literal(node)) != NULL) {
+        if ((literal = cmark_node_get_literal(node)) != nullptr) {
             unsigned saved = r->style;
             set_style(r, saved | STYLE_CODE);
             put_text(r, literal);
@@ -508,8 +525,8 @@ static void render_code_block(Renderer *r, cmark_node *node, int indent)
         put_text(r, "│ ");
         const char *nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        fwrite(p, 1, len, stdout);
-        r->wrote_any = 1;
+        out_bytes(r, p, len);
+        r->wrote_any = true;
         r->trailing_newlines = 0;
         put_char(r, '\n');
         if (!nl)
@@ -525,54 +542,81 @@ static void render_code_block(Renderer *r, cmark_node *node, int indent)
     ensure_lines(r, 2);
 }
 
+/* A GFM task-list checkbox: "[ ] ", "[x] " or "[X] " at the very start of
+ * an item's text. Returns true and fills the checked flag when matched. */
+static bool is_task_marker(const char *literal, bool *checked)
+{
+    if (!literal || strlen(literal) < 4 || literal[0] != '[' ||
+        literal[2] != ']' ||
+        (literal[3] != ' ' && literal[3] != '\t'))
+        return false;
+    if (literal[1] == ' ')
+        *checked = false;
+    else if (literal[1] == 'x' || literal[1] == 'X')
+        *checked = true;
+    else
+        return false;
+    return true;
+}
+
+/*
+ * Choose the marker for a list item's first paragraph. `literal` is that
+ * paragraph's leading text (or null). Writes the marker glyph and its color
+ * and returns the number of leading text bytes the marker consumes (nonzero
+ * only for task checkboxes, whose "[x] " prefix is not re-rendered).
+ */
+static size_t list_marker(const char *literal, cmark_list_type type,
+                          int number, char marker[static 32], unsigned *style)
+{
+    bool checked = false;
+    if (is_task_marker(literal, &checked)) {
+        snprintf(marker, 32, "%s ", checked ? "☑" : "☐");
+        *style = checked ? STYLE_SUCCESS : STYLE_WARNING;
+        size_t skip = 4;
+        while (literal[skip] == ' ' || literal[skip] == '\t')
+            skip++;
+        return skip;
+    }
+
+    *style = STYLE_ACCENT;
+    if (type == CMARK_ORDERED_LIST)
+        snprintf(marker, 32, "%d. ", number);
+    else
+        snprintf(marker, 32, "• ");
+    return 0;
+}
+
 static void render_item(Renderer *r, cmark_node *item, int indent,
                         cmark_list_type type, int number)
 {
-    cmark_node *child = cmark_node_first_child(item);
-    int first = 1;
+    bool first = true;
 
-    for (; child; child = cmark_node_next(child)) {
-        cmark_node_type child_type = cmark_node_get_type(child);
-        if (first && child_type == CMARK_NODE_PARAGRAPH) {
-            char marker[32];
-            size_t skip = 0;
-            unsigned marker_style = STYLE_ACCENT;
-            cmark_node *first_inline = cmark_node_first_child(child);
-            const char *literal =
-                first_inline &&
-                cmark_node_get_type(first_inline) == CMARK_NODE_TEXT
-                    ? cmark_node_get_literal(first_inline) : NULL;
-            if (literal && strlen(literal) >= 4 && literal[0] == '[' &&
-                (literal[1] == ' ' || literal[1] == 'x' ||
-                 literal[1] == 'X') &&
-                literal[2] == ']' &&
-                (literal[3] == ' ' || literal[3] == '\t')) {
-                int checked = literal[1] == 'x' || literal[1] == 'X';
-                snprintf(marker, sizeof marker, "%s ", checked ? "☑" : "☐");
-                marker_style = checked ? STYLE_SUCCESS : STYLE_WARNING;
-                skip = 4;
-                while (literal[skip] == ' ' || literal[skip] == '\t')
-                    skip++;
-            } else if (type == CMARK_ORDERED_LIST) {
-                snprintf(marker, sizeof marker, "%d. ", number);
-            } else {
-                snprintf(marker, sizeof marker, "• ");
-            }
-
-            r->indent = indent;
-            unsigned saved = r->style;
-            set_style(r, marker_style);
-            put_text(r, marker);
-            set_style(r, saved);
-            r->indent = indent + (int)utf8_width(marker);
-            render_inlines_skip(r, child, skip);
-            put_char(r, '\n');
-        } else if (child_type == CMARK_NODE_LIST) {
+    for (cmark_node *child = cmark_node_first_child(item); child;
+         child = cmark_node_next(child), first = false) {
+        if (!first || cmark_node_get_type(child) != CMARK_NODE_PARAGRAPH) {
             render_block(r, child, indent + 2, 1);
-        } else {
-            render_block(r, child, indent + 2, 1);
+            continue;
         }
-        first = 0;
+
+        cmark_node *first_inline = cmark_node_first_child(child);
+        const char *literal =
+            first_inline &&
+            cmark_node_get_type(first_inline) == CMARK_NODE_TEXT
+                ? cmark_node_get_literal(first_inline) : nullptr;
+
+        char marker[32];
+        unsigned marker_style;
+        size_t skip = list_marker(literal, type, number, marker,
+                                  &marker_style);
+
+        r->indent = indent;
+        unsigned saved = r->style;
+        set_style(r, marker_style);
+        put_text(r, marker);
+        set_style(r, saved);
+        r->indent = indent + (int)utf8_width(marker);
+        render_inlines_skip(r, child, skip);
+        put_char(r, '\n');
     }
     ensure_lines(r, 1);
 }
@@ -695,7 +739,7 @@ static void row_free(TableRow *row)
     for (size_t i = 0; i < row->count; i++)
         free(row->cells[i]);
     free(row->cells);
-    row->cells = NULL;
+    row->cells = nullptr;
     row->count = 0;
 }
 
@@ -907,8 +951,8 @@ static size_t cell_width(const char *cell)
 {
     Buffer rendered = {0};
     Renderer measure = {
-        .line_start = 0,
-        .out = &rendered
+        .line_start = false,
+        .out = &rendered,
     };
     render_cell(&measure, cell);
     size_t width = utf8_width(rendered.data ? rendered.data : cell);
@@ -1047,6 +1091,78 @@ static void render_commonmark(Renderer *r, const char *text, size_t len)
     cmark_node_free(doc);
 }
 
+/*
+ * Try to parse a GFM table whose header is the line [p, p+len) and whose
+ * delimiter is `following`. On success fills `*out` and returns the
+ * position just past the last data row; otherwise leaves `*out` untouched
+ * and returns nullptr. All scratch allocations are released on failure.
+ */
+static const char *scan_table(const char *p, size_t len,
+                              const char *following, Table *out)
+{
+    if (!*following)
+        return nullptr;
+
+    const char *delim_end = line_end(following);
+    TableRow header = {0}, delimiter = {0};
+    int header_ok = parse_pipe_row(p, len, &header);
+    int delim_ok = parse_pipe_row(following,
+                                  (size_t)(delim_end - following), &delimiter);
+    int *align = nullptr;
+    int valid_delim = delim_ok > 0 ? parse_delimiter(&delimiter, &align) : 0;
+
+    if (header_ok <= 0 || valid_delim <= 0 ||
+        header.count != delimiter.count) {
+        free(align);
+        row_free(&header);
+        row_free(&delimiter);
+        return nullptr;
+    }
+    row_free(&delimiter);
+
+    Table table = { .columns = header.count, .align = align };
+    if (table_add_row(&table, &header) != 0) {
+        row_free(&header);
+        table_free(&table);
+        return nullptr;
+    }
+
+    const char *after = next_line(delim_end);
+    while (*after) {
+        const char *data_end = line_end(after);
+        TableRow data = {0};
+        int data_ok =
+            parse_pipe_row(after, (size_t)(data_end - after), &data);
+        if (data_ok <= 0 || table_add_row(&table, &data) != 0) {
+            row_free(&data);
+            break;
+        }
+        after = next_line(data_end);
+    }
+
+    *out = table;
+    return after;
+}
+
+/* Track fenced-code state so pipe rows inside a code fence are not mistaken
+ * for tables. `*marker`/`*length` describe the currently open fence (length
+ * 0 when none). */
+static void update_fence(const char *p, size_t len,
+                         char *marker, int *length)
+{
+    char c = '\0';
+    int run = fence_run(p, len, &c);
+    if (!run)
+        return;
+    if (!*length) {
+        *marker = c;
+        *length = run;
+    } else if (c == *marker && run >= *length) {
+        *marker = '\0';
+        *length = 0;
+    }
+}
+
 void md_render(const char *text, int color)
 {
     if (!text)
@@ -1054,11 +1170,11 @@ void md_render(const char *text, int color)
 
     Renderer r = {
         .color = color,
-        .line_start = 1
+        .line_start = true,
     };
     const char *p = text;
     const char *prose = text;
-    char fence_marker_char = '\0';
+    char fence_marker = '\0';
     int fence_length = 0;
 
     while (*p) {
@@ -1066,71 +1182,19 @@ void md_render(const char *text, int color)
         size_t len = (size_t)(end - p);
         const char *following = next_line(end);
 
-        if (!fence_length && *following) {
-            const char *delim_end = line_end(following);
-            TableRow header = {0}, delimiter = {0};
-            int header_ok = parse_pipe_row(p, len, &header);
-            int delim_ok =
-                parse_pipe_row(following,
-                               (size_t)(delim_end - following), &delimiter);
-            int *align = NULL;
-            int valid_delim = delim_ok > 0
-                                  ? parse_delimiter(&delimiter, &align) : 0;
-
-            if (header_ok > 0 && valid_delim > 0 &&
-                header.count == delimiter.count) {
-                Table table = {
-                    .columns = header.count,
-                    .align = align
-                };
-                row_free(&delimiter);
-                if (table_add_row(&table, &header) != 0) {
-                    row_free(&header);
-                    table_free(&table);
-                    break;
-                }
-
-                const char *after = next_line(delim_end);
-                while (*after) {
-                    const char *data_end = line_end(after);
-                    TableRow data = {0};
-                    int data_ok =
-                        parse_pipe_row(after, (size_t)(data_end - after),
-                                       &data);
-                    if (data_ok <= 0) {
-                        row_free(&data);
-                        break;
-                    }
-                    if (table_add_row(&table, &data) != 0) {
-                        row_free(&data);
-                        break;
-                    }
-                    after = next_line(data_end);
-                }
-
-                render_commonmark(&r, prose, (size_t)(p - prose));
-                render_table(&r, &table);
-                table_free(&table);
-                p = after;
-                prose = after;
-                continue;
-            }
-            free(align);
-            row_free(&header);
-            row_free(&delimiter);
+        Table table;
+        const char *after = fence_length
+                                ? nullptr
+                                : scan_table(p, len, following, &table);
+        if (after) {
+            render_commonmark(&r, prose, (size_t)(p - prose));
+            render_table(&r, &table);
+            table_free(&table);
+            p = prose = after;
+            continue;
         }
 
-        char marker = '\0';
-        int run = fence_run(p, len, &marker);
-        if (run) {
-            if (!fence_length) {
-                fence_marker_char = marker;
-                fence_length = run;
-            } else if (marker == fence_marker_char && run >= fence_length) {
-                fence_marker_char = '\0';
-                fence_length = 0;
-            }
-        }
+        update_fence(p, len, &fence_marker, &fence_length);
         p = following;
     }
 

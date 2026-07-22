@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wextra -std=c11
+CFLAGS  ?= -O2 -Wall -Wextra -std=c23
 CFLAGS  += -D_POSIX_C_SOURCE=200809L -pthread \
            $(shell pkg-config --cflags libcurl libcmark)
 LDFLAGS += -pthread

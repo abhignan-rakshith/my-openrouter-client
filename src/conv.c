@@ -1,5 +1,9 @@
 /*
  * conv.c — JSONL conversation persistence.
+ *
+ * Each conversation is a file under conversations/<name>.jsonl holding one
+ * chat message object per line. See conv.h for the on-disk format and the
+ * contract of each public function.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -11,14 +15,20 @@
 #include "jsonutil.h"
 #include "md.h"
 
+/* Longest suffix we may append when a name lacks it. */
+static constexpr char JSONL_EXT[] = ".jsonl";
+
 int conv_path(const char *name, char *out, size_t outsz)
 {
     if (!name || !*name || strchr(name, '/'))
         return -1;
+
     size_t nlen = strlen(name);
+    size_t elen = sizeof JSONL_EXT - 1;
     const char *suffix =
-        (nlen > 6 && strcmp(name + nlen - 6, ".jsonl") == 0)
-            ? "" : ".jsonl";
+        (nlen > elen && strcmp(name + nlen - elen, JSONL_EXT) == 0)
+            ? "" : JSONL_EXT;
+
     int n = snprintf(out, outsz, "%s/%s%s", ORC_CONV_DIR, name, suffix);
     return (n < 0 || (size_t)n >= outsz) ? -1 : 0;
 }
@@ -33,10 +43,26 @@ int conv_ensure_dir(void)
 }
 
 /*
+ * Read the next line from f into the getline-managed buffer (*line, *cap),
+ * stripping any trailing CR/LF so callers see the logical content only.
+ * Returns the trimmed length, or -1 at EOF or on a read error (which the
+ * caller distinguishes with ferror once the loop ends).
+ */
+static ssize_t read_line_trimmed(FILE *f, char **line, size_t *cap)
+{
+    ssize_t n = getline(line, cap, f);
+    if (n < 0)
+        return -1;
+    while (n > 0 && ((*line)[n - 1] == '\n' || (*line)[n - 1] == '\r'))
+        (*line)[--n] = '\0';
+    return n;
+}
+
+/*
  * Sanity-check that a line looks like a message object before it is
  * replayed to the API: it must parse as {"role": "...", "content": "..."}.
  */
-static int line_is_message(const char *line)
+static bool line_is_message(const char *line)
 {
     const char *role = json_find_key(line, "role");
     const char *content = json_find_key(line, "content");
@@ -54,16 +80,13 @@ int conv_load(const char *path, Buffer *items)
         return -1;
     }
 
-    char *line = NULL;
+    char *line = nullptr;
     size_t cap = 0;
     ssize_t n;
     int lineno = 0;
     int rc = 0;
-    while ((n = getline(&line, &cap, f)) != -1) {
+    while ((n = read_line_trimmed(f, &line, &cap)) != -1) {
         lineno++;
-        /* Trim trailing newline. */
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-            line[--n] = '\0';
         if (n == 0)
             continue; /* blank line */
         if (!line_is_message(line)) {
@@ -80,7 +103,7 @@ int conv_load(const char *path, Buffer *items)
         }
     }
     free(line);
-    if (ferror(f)) {
+    if (rc == 0 && ferror(f)) {
         fprintf(stderr, "error: read error on %s\n", path);
         rc = -1;
     }
@@ -89,17 +112,16 @@ int conv_load(const char *path, Buffer *items)
 }
 
 /* Render one {"role":...,"content":...} object into a Buffer. */
-static int render_message(Buffer *out, const char *role,
-                          const char *content)
+static int render_message(Buffer *out, const char *role, const char *content)
 {
     char *esc = json_escape(content);
     if (!esc)
         return -1;
-    int bad = buf_append_str(out, "{\"role\":\"") ||
-              buf_append_str(out, role)           ||
-              buf_append_str(out, "\",\"content\":\"") ||
-              buf_append_str(out, esc)            ||
-              buf_append_str(out, "\"}");
+    bool bad = buf_append_str(out, "{\"role\":\"")      ||
+               buf_append_str(out, role)                ||
+               buf_append_str(out, "\",\"content\":\"") ||
+               buf_append_str(out, esc)                 ||
+               buf_append_str(out, "\"}");
     free(esc);
     return bad ? -1 : 0;
 }
@@ -120,13 +142,18 @@ int conv_append(const char *path, const char *role, const char *content)
         buf_free(&msg);
         return -1;
     }
+
     int rc = 0;
     if (fprintf(f, "%s\n", msg.data) < 0 || fflush(f) != 0) {
         fprintf(stderr, "error: write failed on %s: %s\n",
                 path, strerror(errno));
         rc = -1;
     }
-    fclose(f);
+    if (fclose(f) != 0 && rc == 0) {
+        fprintf(stderr, "error: write failed on %s: %s\n",
+                path, strerror(errno));
+        rc = -1;
+    }
     buf_free(&msg);
     return rc;
 }
@@ -136,6 +163,26 @@ int conv_items_add(Buffer *items, const char *role, const char *content)
     if (items->len && buf_append_str(items, ",") != 0)
         return -1;
     return render_message(items, role, content);
+}
+
+/* Print one already-decoded message in the interactive prompt's style. */
+static void show_message(const char *role, const char *content, int markdown)
+{
+    if (strcmp(role, "user") == 0) {
+        printf("\nyou> %s\n", content);
+    } else if (strcmp(role, "assistant") == 0) {
+        if (markdown) {
+            if (md_color_enabled())
+                fputs("\n\033[1;38;5;141massistant>\033[0m\n", stdout);
+            else
+                fputs("\nassistant>\n", stdout);
+            md_render(content, md_color_enabled());
+        } else {
+            printf("\nassistant> %s\n", content);
+        }
+    } else {
+        printf("\n%s> %s\n", role, content);
+    }
 }
 
 int conv_show(const char *path, int markdown)
@@ -149,40 +196,23 @@ int conv_show(const char *path, int markdown)
         return -1;
     }
 
-    char *line = NULL;
+    char *line = nullptr;
     size_t cap = 0;
     ssize_t n;
     int rc = 0;
-    while ((n = getline(&line, &cap, f)) != -1) {
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-            line[--n] = '\0';
+    while ((n = read_line_trimmed(f, &line, &cap)) != -1) {
         if (n == 0)
             continue;
 
         const char *role_value = json_find_key(line, "role");
         const char *content_value = json_find_key(line, "content");
         char *role = role_value && *role_value == '"'
-                         ? json_decode_string(role_value, NULL) : NULL;
+                         ? json_decode_string(role_value, nullptr) : nullptr;
         char *content = content_value && *content_value == '"'
-                            ? json_decode_string(content_value, NULL) : NULL;
-        if (role && content) {
-            if (strcmp(role, "user") == 0) {
-                printf("\nyou> %s\n", content);
-            } else if (strcmp(role, "assistant") == 0) {
-                if (markdown) {
-                    if (md_color_enabled())
-                        fputs("\n\033[1;38;5;141massistant>\033[0m\n",
-                              stdout);
-                    else
-                        fputs("\nassistant>\n", stdout);
-                    md_render(content, md_color_enabled());
-                } else {
-                    printf("\nassistant> %s\n", content);
-                }
-            } else {
-                printf("\n%s> %s\n", role, content);
-            }
-        }
+                            ? json_decode_string(content_value, nullptr)
+                            : nullptr;
+        if (role && content)
+            show_message(role, content, markdown);
         free(role);
         free(content);
     }
@@ -211,6 +241,8 @@ int conv_rename(const char *oldpath, const char *newpath)
         return -1;
     }
 
+    /* A not-yet-created source (no messages written) is not an error: the
+     * caller can simply adopt newpath. */
     if (rename(oldpath, newpath) == 0 || errno == ENOENT)
         return 0;
 
