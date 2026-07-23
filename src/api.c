@@ -7,11 +7,13 @@
  *     assistant tokens to stdout, and accumulate the full reply.
  * Every exit frees the curl handle, the header slist, and all buffers.
  */
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 #include <curl/curl.h>
 
 #include "api.h"
@@ -81,6 +83,7 @@ typedef struct {
     OrStreamCb on_update; /* live-render callback, or NULL              */
     void      *on_update_user;
     Buffer    *errs;      /* error sink from the request, or NULL       */
+    bool       cancelled; /* user pressed Esc; keep the partial reply   */
 } StreamState;
 
 static void stream_stop_spinner(StreamState *st)
@@ -145,6 +148,34 @@ static void sse_line(StreamState *st, const char *line)
         st->got_error = true;
         free(err);
     }
+}
+
+/*
+ * Progress callback while esc_cancel is armed: poll stdin (which the
+ * caller holds in raw mode) for a bare Esc keypress. curl invokes this
+ * regularly even when no data is arriving, so a stalled stream can
+ * still be interrupted. Escape *sequences* (arrow keys, pastes) start
+ * with the same byte but arrive with a payload; only a lone 0x1b read
+ * cancels. Other typed input during the stream is discarded. Returning
+ * nonzero aborts the transfer (CURLE_ABORTED_BY_CALLBACK).
+ */
+static int esc_poll_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                       curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    StreamState *st = ud;
+    struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+    while (poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN)) {
+        char b[64];
+        ssize_t n = read(STDIN_FILENO, b, sizeof b);
+        if (n <= 0)
+            break;
+        if (n == 1 && b[0] == '\033') {
+            st->cancelled = true;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Capture the Retry-After response header (seconds) for 429/503. */
@@ -344,6 +375,11 @@ int or_chat(const OrRequest *req, char **reply)
     if (req->stream) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sse_cb);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &st);
+        if (req->esc_cancel) {
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, esc_poll_cb);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &st);
+        }
     } else {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect_cb);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
@@ -364,7 +400,23 @@ int or_chat(const OrRequest *req, char **reply)
     buf_free(&body);
 
     int result = -1;
-    if (rc != CURLE_OK) {
+    if (st.cancelled) {
+        /* User pressed Esc. A partial reply counts as the result so it
+         * can be rendered and persisted; with nothing received yet the
+         * turn simply fails (the caller rolls it back). */
+        if (st.reply.len) {
+            if (st.printing)
+                fputc('\n', stdout);
+            emit_error(req->errs,
+                       "note: interrupted; partial reply kept\n");
+            *reply = st.reply.data; /* transfer ownership */
+            st.reply.data = nullptr;
+            result = 0;
+        } else {
+            emit_error(req->errs,
+                       "note: interrupted before any reply arrived\n");
+        }
+    } else if (rc != CURLE_OK) {
         if (st.printing && st.reply.len)
             fputc('\n', stdout);
         emit_error(req->errs, "error: request failed: %s\n",

@@ -30,6 +30,15 @@
 typedef char *(*LePasteCb)(void *user, char **msg);
 
 /*
+ * Enter/leave raw mode outside le_readline — e.g. so the caller can
+ * watch stdin for Esc while a reply streams. The fatal-signal path
+ * (le_signal_restore) covers this raw session too. le_raw_on returns
+ * 0, or -1 when stdin is not a terminal / raw mode failed.
+ */
+int  le_raw_on(void);
+void le_raw_off(void);
+
+/*
  * Read one line, editing in raw mode when stdin is a terminal. The
  * prompt may contain ANSI color escapes (excluded from width math).
  * Returns a malloc'd line without the trailing newline, or NULL on

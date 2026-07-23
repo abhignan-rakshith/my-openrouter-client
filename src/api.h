@@ -33,6 +33,10 @@ typedef struct {
     int         markdown;      /* 1 = caller renders completed reply  */
     OrStreamCb  on_update;     /* live-render callback, or NULL       */
     void       *on_update_user;/* opaque arg passed to on_update      */
+    int         esc_cancel;    /* 1 = a bare Esc on stdin cancels the
+                                  stream; any partial reply is still
+                                  returned as the result. The caller
+                                  must have stdin in raw mode.        */
     Buffer     *errs;          /* when set, error diagnostics are
                                   appended here instead of stderr (for
                                   callers whose screen is transient,

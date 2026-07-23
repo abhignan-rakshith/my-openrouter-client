@@ -89,6 +89,7 @@ static void usage(const char *prog)
         "/quit (or Ctrl-D) ends the session.\n"
         "\\+Enter (or Shift+Enter in supporting terminals) starts a new\n"
         "line without sending, for multi-line messages.\n"
+        "Esc interrupts a streaming reply, keeping the partial text.\n"
         "Ctrl+V pastes an image from the clipboard ([Image N] placeholder);\n"
         "it is sent as multimodal content to vision-capable models.\n"
         "\n"
@@ -608,9 +609,18 @@ static int run_turn(const OrRequest *base, Buffer *items,
         req.errs = &errs;
     }
 
+    /* Esc interrupts a streaming reply, keeping the partial text. Raw
+     * mode makes the keypress readable immediately (and stops stray
+     * typing echoing over the stream); the fatal-signal path restores
+     * the terminal if we die mid-stream. */
+    if (req.stream && le_raw_on() == 0)
+        req.esc_cancel = 1;
+
     char *reply = nullptr;
     int rc = or_chat(&req, &reply);
 
+    if (req.esc_cancel)
+        le_raw_off();
     if (live)               /* drop the raw stream; back to the main screen */
         alt_screen_leave();
     if (errs.len)           /* now safe to show what went wrong */
@@ -694,6 +704,7 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
         printf("Ctrl+V pastes an image from the clipboard.\n");
         printf("\\+Enter (or Shift+Enter) starts a new line.\n");
         printf("Multi-line pastes show as [Pasted #N] and expand on send.\n");
+        printf("Esc interrupts a reply, keeping the partial text.\n");
     }
     if (path) {
         printf("Conversation: %s\n", path);

@@ -78,6 +78,19 @@ static void raw_disable(void)
     g_raw = 0;
 }
 
+int le_raw_on(void)
+{
+    if (!isatty(STDIN_FILENO))
+        return -1;
+    return raw_enable();
+}
+
+void le_raw_off(void)
+{
+    if (g_raw)
+        raw_disable();
+}
+
 /* ------------------------------------------------------------------ */
 /* UTF-8 stepping and display width                                    */
 /* ------------------------------------------------------------------ */
