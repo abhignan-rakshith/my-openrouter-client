@@ -7,9 +7,11 @@
  *     assistant tokens to stdout, and accumulate the full reply.
  * Every exit frees the curl handle, the header slist, and all buffers.
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <curl/curl.h>
 
 #include "api.h"
@@ -19,6 +21,35 @@
 
 /* Overall transfer deadline, in seconds. */
 constexpr long ORC_TIMEOUT_SECS = 300;
+
+/*
+ * Route a diagnostic to stderr, or into the caller's error sink when
+ * one was supplied — callers streaming on the alternate screen collect
+ * errors there and print them once the real screen is back, since
+ * anything written during the stream is wiped with the screen.
+ */
+static void emit_error(Buffer *errs, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (!errs) {
+        vfprintf(stderr, fmt, ap);
+    } else {
+        va_list ap2;
+        va_copy(ap2, ap);
+        int n = vsnprintf(nullptr, 0, fmt, ap);
+        if (n >= 0) {
+            char *tmp = malloc((size_t)n + 1);
+            if (tmp) {
+                vsnprintf(tmp, (size_t)n + 1, fmt, ap2);
+                buf_append_str(errs, tmp);
+                free(tmp);
+            }
+        }
+        va_end(ap2);
+    }
+    va_end(ap);
+}
 
 /* ------------------------------------------------------------------ */
 /* curl write callbacks                                                */
@@ -49,6 +80,7 @@ typedef struct {
     bool       oom;       /* allocation failure mid-stream              */
     OrStreamCb on_update; /* live-render callback, or NULL              */
     void      *on_update_user;
+    Buffer    *errs;      /* error sink from the request, or NULL       */
 } StreamState;
 
 static void stream_stop_spinner(StreamState *st)
@@ -56,6 +88,10 @@ static void stream_stop_spinner(StreamState *st)
     spinner_stop(st->spinner);
     st->spinner = nullptr;
 }
+
+/* Defined with the request path below; also used for SSE error events. */
+static void report_api_error(Buffer *errs, long code, long retry_after,
+                             const char *json);
 
 /* Handle one complete, NUL-terminated SSE line. */
 static void sse_line(StreamState *st, const char *line)
@@ -100,13 +136,25 @@ static void sse_line(StreamState *st, const char *line)
      * finish_reason) or an in-stream error event. */
     char *err = extract_error(data);
     if (err) {
+        /* Mid-stream error event: HTTP 200 is already committed, so
+         * the real code travels in the JSON (finish_reason "error"). */
         stream_stop_spinner(st);
         if (st->printing && st->reply.len)
             fputc('\n', stdout);
-        fprintf(stderr, "error: %s\n", err);
+        report_api_error(st->errs, 0, 0, data);
         st->got_error = true;
         free(err);
     }
+}
+
+/* Capture the Retry-After response header (seconds) for 429/503. */
+static size_t header_cb(char *ptr, size_t size, size_t nmemb, void *ud)
+{
+    long *retry_after = ud;
+    size_t n = size * nmemb;
+    if (n > 12 && strncasecmp(ptr, "Retry-After:", 12) == 0)
+        *retry_after = strtol(ptr + 12, nullptr, 10);
+    return n;
 }
 
 static size_t sse_cb(char *ptr, size_t size, size_t nmemb, void *ud)
@@ -143,17 +191,65 @@ static size_t sse_cb(char *ptr, size_t size, size_t nmemb, void *ud)
 /* Request                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Report an error payload (JSON message if parseable, raw otherwise). */
-static void report_http_error(long status, const char *body)
+/*
+ * An actionable next step for the well-known OpenRouter statuses
+ * (https://openrouter.ai/docs/api_reference/errors-and-debugging), or
+ * NULL when the error message speaks for itself.
+ */
+static const char *status_hint(long status)
 {
-    char *err = body ? extract_error(body) : nullptr;
-    if (err) {
-        fprintf(stderr, "error (HTTP %ld): %s\n", status, err);
-        free(err);
-    } else {
-        fprintf(stderr, "error (HTTP %ld): unexpected response:\n%s\n",
-                status, body && *body ? body : "(empty)");
+    switch (status) {
+    case 401: return "check your API key: orc config set key <API_KEY>";
+    case 402: return "add credits to your OpenRouter account";
+    case 408: return "the request timed out; try again";
+    case 429: return "rate limited; wait a moment or switch models with -m";
+    case 502: return "provider trouble; retry, or switch models with -m";
+    case 503: return "no provider available right now; retry shortly";
+    default:  return nullptr;
     }
+}
+
+/*
+ * Diagnose an API error payload: "error (HTTP <code>[, <error_type>]):
+ * <message>", plus an actionable hint for well-known statuses and the
+ * server's Retry-After when it sent one. `code` 0 means "unknown"
+ * (used for mid-stream events whose code lives in the JSON instead).
+ * A 200 with no extractable error means the model produced no content
+ * at all — per the docs, likely warm-up; suggest retrying.
+ */
+static void report_api_error(Buffer *errs, long code, long retry_after,
+                             const char *json)
+{
+    char *msg  = json ? extract_error(json) : nullptr;
+    char *type = json ? extract_error_type(json) : nullptr;
+    if (code == 0 && json)
+        code = extract_error_code(json);
+
+    if (msg && code) {
+        emit_error(errs, "error (HTTP %ld%s%s): %s\n", code,
+                   type ? ", " : "", type ? type : "", msg);
+    } else if (msg) {
+        emit_error(errs, "error%s%s: %s\n",
+                   type ? ", " : "", type ? type : "", msg);
+    } else if (code == 200) {
+        emit_error(errs, "error: the model returned no content "
+                         "(it may be warming up); try again\n");
+    } else {
+        emit_error(errs, "error (HTTP %ld): unexpected response:\n%s\n",
+                   code, json && *json ? json : "(empty)");
+    }
+
+    const char *hint = status_hint(code);
+    if (hint && retry_after > 0)
+        emit_error(errs, "  (%s; server says retry after %lds)\n",
+                   hint, retry_after);
+    else if (hint)
+        emit_error(errs, "  (%s)\n", hint);
+    else if (retry_after > 0)
+        emit_error(errs, "  (server says retry after %lds)\n", retry_after);
+
+    free(msg);
+    free(type);
 }
 
 /*
@@ -189,13 +285,13 @@ int or_chat(const OrRequest *req, char **reply)
 
     Buffer body = {0};
     if (build_body(req, &body) != 0) {
-        fprintf(stderr, "error: out of memory\n");
+        emit_error(req->errs, "error: out of memory\n");
         return -1;
     }
 
     CURL *curl = curl_easy_init();
     if (!curl) {
-        fprintf(stderr, "error: curl init failed\n");
+        emit_error(req->errs, "error: curl init failed\n");
         buf_free(&body);
         return -1;
     }
@@ -204,7 +300,7 @@ int or_chat(const OrRequest *req, char **reply)
     int hn = snprintf(auth_header, sizeof auth_header,
                       "Authorization: Bearer %s", req->api_key);
     if (hn < 0 || (size_t)hn >= sizeof auth_header) {
-        fprintf(stderr, "error: API key is implausibly long\n");
+        emit_error(req->errs, "error: API key is implausibly long\n");
         curl_easy_cleanup(curl);
         buf_free(&body);
         return -1;
@@ -215,7 +311,7 @@ int or_chat(const OrRequest *req, char **reply)
         ? curl_slist_append(headers, "Content-Type: application/json")
         : nullptr;
     if (!ct) {
-        fprintf(stderr, "error: out of memory\n");
+        emit_error(req->errs, "error: out of memory\n");
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         buf_free(&body);
@@ -227,14 +323,18 @@ int or_chat(const OrRequest *req, char **reply)
     StreamState st   = {0};
     st.on_update = req->on_update;
     st.on_update_user = req->on_update_user;
+    st.errs = req->errs;
     /* The callback owns display when present, so plain echo is off then. */
     st.printing = req->stream && !req->quiet && !st.on_update;
     Spinner *spinner = req->spinner ? spinner_start("Thinking") : nullptr;
     if (req->stream)
         st.spinner = spinner;
 
+    long retry_after = 0;
     curl_easy_setopt(curl, CURLOPT_URL, ORC_API_URL);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &retry_after);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, ORC_TIMEOUT_SECS);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "orc/0.2 (native C)");
@@ -267,8 +367,8 @@ int or_chat(const OrRequest *req, char **reply)
     if (rc != CURLE_OK) {
         if (st.printing && st.reply.len)
             fputc('\n', stdout);
-        fprintf(stderr, "error: request failed: %s\n",
-                st.oom ? "out of memory" : curl_easy_strerror(rc));
+        emit_error(req->errs, "error: request failed: %s\n",
+                   st.oom ? "out of memory" : curl_easy_strerror(rc));
     } else if (req->stream) {
         if (st.reply.len && !st.got_error) {
             if (st.printing)
@@ -276,10 +376,16 @@ int or_chat(const OrRequest *req, char **reply)
             *reply = st.reply.data; /* transfer ownership */
             st.reply.data = nullptr;
             result = 0;
-        } else if (!st.got_error) {
+        } else if (st.got_error) {
+            /* The SSE error event was already reported as it arrived. */
+            if (st.reply.len)
+                emit_error(req->errs,
+                           "note: the partial reply was discarded\n");
+        } else {
             /* Nothing streamed and no SSE error: the server most likely
              * replied with a plain JSON error body. */
-            report_http_error(http_status, st.raw.data);
+            report_api_error(req->errs, http_status, retry_after,
+                             st.raw.data);
         }
     } else {
         char *content = resp.data ? extract_content(resp.data) : nullptr;
@@ -289,7 +395,8 @@ int or_chat(const OrRequest *req, char **reply)
             *reply = content; /* transfer ownership */
             result = 0;
         } else {
-            report_http_error(http_status, resp.data);
+            report_api_error(req->errs, http_status, retry_after,
+                             resp.data);
         }
     }
 

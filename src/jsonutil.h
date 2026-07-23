@@ -48,4 +48,12 @@ char *extract_delta(const char *json);
 /* error.message of an error payload, or NULL. */
 char *extract_error(const char *json);
 
+/* error.metadata.error_type — OpenRouter's canonical error category
+ * (e.g. "rate_limit_exceeded") — or NULL when absent. */
+char *extract_error_type(const char *json);
+
+/* error.code of an error payload (the effective HTTP status, also sent
+ * in mid-stream SSE error events), or 0 when absent. */
+long extract_error_code(const char *json);
+
 #endif /* ORC_JSONUTIL_H */

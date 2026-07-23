@@ -262,3 +262,26 @@ char *extract_error(const char *json)
 {
     return extract_nested_string(json, "error", "message");
 }
+
+char *extract_error_type(const char *json)
+{
+    const char *e = json_find_key(json, "error");
+    if (!e)
+        return nullptr;
+    const char *m = json_find_key(e, "metadata");
+    if (!m)
+        return nullptr;
+    const char *v = json_find_key(m, "error_type");
+    if (!v || *v != '"')
+        return nullptr;
+    return json_decode_string(v, nullptr);
+}
+
+long extract_error_code(const char *json)
+{
+    const char *e = json_find_key(json, "error");
+    const char *v = e ? json_find_key(e, "code") : nullptr;
+    if (!v || *v < '0' || *v > '9')
+        return 0;
+    return strtol(v, nullptr, 10);
+}

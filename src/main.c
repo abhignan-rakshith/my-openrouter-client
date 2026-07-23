@@ -504,9 +504,31 @@ static char *build_mm_content(PasteCtx *pc, const char *text, bool *oom)
 }
 
 /*
+ * Undo the user-message append after a failed exchange, so a message
+ * the model never answered doesn't poison the next request or persist
+ * in the conversation file. `len0`/`fsize0` are the history sizes
+ * captured before the append (fsize0 < 0: the file didn't exist yet).
+ */
+static void rollback_turn(Buffer *items, size_t len0,
+                          const char *path, off_t fsize0)
+{
+    items->len = len0;
+    if (items->data)
+        items->data[len0] = '\0';
+    if (!path)
+        return;
+    if (fsize0 < 0)
+        remove(path);
+    else if (truncate(path, fsize0) != 0)
+        fprintf(stderr, "warning: could not remove the failed message "
+                        "from %s\n", path);
+}
+
+/*
  * Run one exchange: append the user message to the in-memory history
  * (and file, if any), call the API with the full history, then record
- * the assistant's reply. Returns 0 on success, -1 on failure.
+ * the assistant's reply. Returns 0 on success, -1 on failure — the
+ * unanswered user message is rolled back from memory and disk.
  *
  * In an interactive color terminal the reply streams in as plain text on
  * the alternate screen for responsiveness; once complete that view is
@@ -521,6 +543,15 @@ static int run_turn(const OrRequest *base, Buffer *items,
                     const char *path, const char *user_msg,
                     const char *content_json)
 {
+    /* Snapshot the history so a failed exchange can be rolled back. */
+    size_t len0   = items->len;
+    off_t  fsize0 = -1;
+    if (path) {
+        struct stat stb;
+        if (stat(path, &stb) == 0)
+            fsize0 = stb.st_size;
+    }
+
     int arc = content_json
         ? conv_items_add_json(items, "user", content_json)
         : conv_items_add(items, "user", user_msg);
@@ -532,8 +563,10 @@ static int run_turn(const OrRequest *base, Buffer *items,
         arc = content_json
             ? conv_append_json(path, "user", content_json)
             : conv_append(path, "user", user_msg);
-        if (arc != 0)
+        if (arc != 0) {
+            rollback_turn(items, len0, path, fsize0);
             return -1;
+        }
     }
 
     /* Wrap the accumulated items in a JSON array. */
@@ -543,6 +576,7 @@ static int run_turn(const OrRequest *base, Buffer *items,
         buf_append_str(&msgs, "]")) {
         fprintf(stderr, "error: out of memory\n");
         buf_free(&msgs);
+        rollback_turn(items, len0, path, fsize0);
         return -1;
     }
 
@@ -560,14 +594,18 @@ static int run_turn(const OrRequest *base, Buffer *items,
         req.quiet = 1;
 
     StreamPaint paint = {0};
+    Buffer errs = {0};
     if (live) {
         /* Stream into the alternate screen, rendered live as Markdown; a
-         * transient banner heads it until the first repaint. */
+         * transient banner heads it until the first repaint. Errors are
+         * collected rather than printed: anything written to the
+         * alternate screen is wiped when it is left. */
         alt_screen_enter();
         print_assistant_banner();
         fflush(stdout);
         req.on_update = stream_repaint;
         req.on_update_user = &paint;
+        req.errs = &errs;
     }
 
     char *reply = nullptr;
@@ -575,10 +613,15 @@ static int run_turn(const OrRequest *base, Buffer *items,
 
     if (live)               /* drop the raw stream; back to the main screen */
         alt_screen_leave();
+    if (errs.len)           /* now safe to show what went wrong */
+        fputs(errs.data, stderr);
+    buf_free(&errs);
 
     buf_free(&msgs);
-    if (rc != 0)
+    if (rc != 0) {
+        rollback_turn(items, len0, path, fsize0);
         return -1;
+    }
 
     if (render) {
         print_assistant_banner();

@@ -9,6 +9,8 @@
 #ifndef ORC_API_H
 #define ORC_API_H
 
+#include "buffer.h"
+
 #define ORC_API_URL "https://openrouter.ai/api/v1/chat/completions"
 #define ORC_API_MODELS_URL "https://openrouter.ai/api/v1/models"
 
@@ -31,6 +33,10 @@ typedef struct {
     int         markdown;      /* 1 = caller renders completed reply  */
     OrStreamCb  on_update;     /* live-render callback, or NULL       */
     void       *on_update_user;/* opaque arg passed to on_update      */
+    Buffer     *errs;          /* when set, error diagnostics are
+                                  appended here instead of stderr (for
+                                  callers whose screen is transient,
+                                  e.g. the alternate-screen stream) */
 } OrRequest;
 
 /*
