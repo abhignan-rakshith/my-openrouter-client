@@ -491,6 +491,36 @@ static void vertical_move(Le *le, int dir)
     le->pos = i;
 }
 
+/* Apply an arrow/Home/End final byte. Reached both by the bare legacy
+ * forms ("CSI A") and the parameterised ones ("CSI 1;<mods>A") the
+ * kitty protocol favours; modifier bits are ignored. */
+static void cursor_key(Le *le, char k)
+{
+    switch (k) {
+    case 'A':                                               /* Up   */
+        if (line_begin(le, le->pos) == 0)
+            hist_recall(le, -1);        /* first line: history */
+        else
+            vertical_move(le, -1);
+        break;
+    case 'B':                                               /* Down */
+        if (line_end(le, le->pos) >= le->len)
+            hist_recall(le, +1);        /* last line: history */
+        else
+            vertical_move(le, +1);
+        break;
+    case 'C': if (le->pos < le->len)
+                  le->pos += ch_len(le->buf + le->pos);
+              break;                    /* right */
+    case 'D': if (le->pos > 0)
+                  le->pos = ch_prev(le->buf, le->pos);
+              break;                    /* left */
+    case 'H': le->pos = line_begin(le, le->pos); break;     /* Home */
+    case 'F': le->pos = line_end(le, le->pos);   break;     /* End  */
+    default:  break;
+    }
+}
+
 /* What an escape sequence asked for beyond in-place cursor motion.
  * Values above ESC_CTRL encode a Ctrl+letter received in CSI-u form:
  * ESC_CTRL + n stands for the C0 byte n (Ctrl+A..Ctrl+Z = 1..26). */
@@ -681,32 +711,13 @@ static int handle_escape(Le *le)
         } else if (c == '~' && strcmp(params, "27;2;13") == 0) {
             /* Shift+Enter via xterm modifyOtherKeys. */
             return ESC_NEWLINE;
+        } else if (c == 'A' || c == 'B' || c == 'C' || c == 'D' ||
+                   c == 'H' || c == 'F') {
+            cursor_key(le, c);          /* "CSI 1;<mods>A" etc. */
         }
         return ESC_NONE;
     }
-    switch (s1) {
-    case 'A':                                               /* Up   */
-        if (line_begin(le, le->pos) == 0)
-            hist_recall(le, -1);        /* first line: history */
-        else
-            vertical_move(le, -1);
-        break;
-    case 'B':                                               /* Down */
-        if (line_end(le, le->pos) >= le->len)
-            hist_recall(le, +1);        /* last line: history */
-        else
-            vertical_move(le, +1);
-        break;
-    case 'C': if (le->pos < le->len)
-                  le->pos += ch_len(le->buf + le->pos);
-              break;                    /* right */
-    case 'D': if (le->pos > 0)
-                  le->pos = ch_prev(le->buf, le->pos);
-              break;                    /* left */
-    case 'H': le->pos = line_begin(le, le->pos); break;     /* Home */
-    case 'F': le->pos = line_end(le, le->pos);   break;     /* End  */
-    default:  break;
-    }
+    cursor_key(le, s1);
     return ESC_NONE;
 }
 
