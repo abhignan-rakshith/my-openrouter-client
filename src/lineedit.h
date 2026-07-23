@@ -6,9 +6,13 @@
  * and a hook on Ctrl+V so the caller can pull an image off the OS
  * clipboard and splice a placeholder like "[Image 1]" into the line.
  *
- * \+Enter — or Shift+Enter in terminals that encode it (CSI-u /
- * modifyOtherKeys) — starts a new line instead of submitting, so a
- * message may span several lines (joined with '\n' in the result).
+ * \+Enter or Shift+Enter starts a new line instead of submitting, so
+ * a message may span several lines (joined with '\n' in the result).
+ * The kitty keyboard protocol is requested while editing so terminals
+ * that speak it (kitty, foot, WezTerm, Ghostty, recent VTE) encode
+ * Shift+Enter distinctly; xterm modifyOtherKeys is understood too.
+ * Up/Down move between the lines of the message — every line stays
+ * editable — and fall through to history recall at the edges.
  *
  * Bracketed paste is enabled while editing: a pasted block never
  * submits the line. Multi-line pastes collapse to a "[Pasted #N +K
