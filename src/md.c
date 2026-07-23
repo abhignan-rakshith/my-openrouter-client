@@ -254,6 +254,201 @@ static char *to_script(const char *s, int super)
 }
 
 /* ------------------------------------------------------------------ */
+/* Inline LaTeX math                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Models frequently emit LaTeX in replies — `$\rightarrow$`,
+ * `$a \times b$`, greek letters — which reads terribly verbatim.
+ * Translate the common commands to their Unicode equivalents; math
+ * spans additionally lose their delimiters, braces, and get ^/_
+ * rendered through the sub/superscript tables.
+ */
+typedef struct { const char *cmd; const char *rep; } LatexSym;
+
+static const LatexSym latex_syms[] = {
+    /* arrows */
+    {"rightarrow", "→"}, {"to", "→"}, {"longrightarrow", "⟶"},
+    {"leftarrow", "←"},  {"gets", "←"}, {"leftrightarrow", "↔"},
+    {"Rightarrow", "⇒"}, {"implies", "⇒"}, {"Leftarrow", "⇐"},
+    {"Leftrightarrow", "⇔"}, {"iff", "⇔"},
+    {"uparrow", "↑"}, {"downarrow", "↓"}, {"mapsto", "↦"},
+    /* operators and relations */
+    {"times", "×"}, {"cdot", "·"}, {"div", "÷"}, {"pm", "±"}, {"mp", "∓"},
+    {"leq", "≤"}, {"le", "≤"}, {"geq", "≥"}, {"ge", "≥"},
+    {"neq", "≠"}, {"ne", "≠"}, {"approx", "≈"}, {"equiv", "≡"},
+    {"sim", "∼"}, {"propto", "∝"}, {"infty", "∞"}, {"sqrt", "√"},
+    {"sum", "∑"}, {"prod", "∏"}, {"int", "∫"}, {"partial", "∂"},
+    {"nabla", "∇"}, {"circ", "∘"}, {"bullet", "•"}, {"star", "⋆"},
+    {"oplus", "⊕"}, {"otimes", "⊗"}, {"ldots", "…"}, {"cdots", "⋯"},
+    {"dots", "…"}, {"prime", "′"}, {"ell", "ℓ"}, {"hbar", "ℏ"},
+    /* sets and logic */
+    {"cup", "∪"}, {"cap", "∩"}, {"subset", "⊂"}, {"supset", "⊃"},
+    {"subseteq", "⊆"}, {"supseteq", "⊇"}, {"in", "∈"}, {"notin", "∉"},
+    {"ni", "∋"}, {"emptyset", "∅"}, {"varnothing", "∅"},
+    {"forall", "∀"}, {"exists", "∃"}, {"neg", "¬"}, {"lnot", "¬"},
+    {"land", "∧"}, {"wedge", "∧"}, {"lor", "∨"}, {"vee", "∨"},
+    {"angle", "∠"}, {"perp", "⊥"}, {"parallel", "∥"},
+    {"therefore", "∴"}, {"because", "∵"}, {"aleph", "ℵ"},
+    /* greek, lower then upper */
+    {"alpha", "α"}, {"beta", "β"}, {"gamma", "γ"}, {"delta", "δ"},
+    {"epsilon", "ε"}, {"varepsilon", "ε"}, {"zeta", "ζ"}, {"eta", "η"},
+    {"theta", "θ"}, {"vartheta", "ϑ"}, {"iota", "ι"}, {"kappa", "κ"},
+    {"lambda", "λ"}, {"mu", "μ"}, {"nu", "ν"}, {"xi", "ξ"}, {"pi", "π"},
+    {"rho", "ρ"}, {"varrho", "ϱ"}, {"sigma", "σ"}, {"varsigma", "ς"},
+    {"tau", "τ"}, {"upsilon", "υ"}, {"phi", "φ"}, {"varphi", "φ"},
+    {"chi", "χ"}, {"psi", "ψ"}, {"omega", "ω"},
+    {"Gamma", "Γ"}, {"Delta", "Δ"}, {"Theta", "Θ"}, {"Lambda", "Λ"},
+    {"Xi", "Ξ"}, {"Pi", "Π"}, {"Sigma", "Σ"}, {"Upsilon", "Υ"},
+    {"Phi", "Φ"}, {"Psi", "Ψ"}, {"Omega", "Ω"},
+    /* spacing / layout: disappear or become a plain space */
+    {"quad", " "}, {"qquad", "  "}, {"left", ""}, {"right", ""},
+    {"displaystyle", ""}, {"text", ""}, {"mathrm", ""}, {"mathbf", ""},
+    {"mathit", ""}, {"mathsf", ""}, {"operatorname", ""},
+};
+
+/* Look up an exact command name of the given length, or NULL. */
+static const char *latex_lookup(const char *name, size_t len)
+{
+    for (size_t i = 0; i < COUNTOF(latex_syms); i++)
+        if (strlen(latex_syms[i].cmd) == len &&
+            memcmp(latex_syms[i].cmd, name, len) == 0)
+            return latex_syms[i].rep;
+    return nullptr;
+}
+
+static size_t alpha_run(const char *s)
+{
+    size_t n = 0;
+    while ((s[n] >= 'a' && s[n] <= 'z') || (s[n] >= 'A' && s[n] <= 'Z'))
+        n++;
+    return n;
+}
+
+/*
+ * Length of the ^/_ or \frac operand at s (within [0, n)): a `{...}`
+ * group or a single character. *start is the operand's offset within
+ * s, *skip the brace overhead; the total consumed is len + *skip.
+ */
+static size_t script_operand(const char *s, size_t n,
+                             size_t *start, size_t *skip)
+{
+    if (n > 0 && s[0] == '{') {
+        const char *close = memchr(s + 1, '}', n - 1);
+        if (close) {
+            *start = 1;
+            *skip  = 2;
+            return (size_t)(close - (s + 1));
+        }
+    }
+    *start = 0;
+    *skip  = 0;
+    return n > 0 ? 1 : 0;
+}
+
+/*
+ * Render n bytes of math-span content to a malloc'd UTF-8 string:
+ * commands via the symbol table (unknown ones kept verbatim), \frac as
+ * a/b, ^/_ through the script tables, braces dropped. NULL on OOM.
+ */
+static char *latex_render(const char *s, size_t n)
+{
+    Buffer out = {0};
+    for (size_t i = 0; i < n; ) {
+        char c = s[i];
+
+        if (c == '\\' && i + 1 < n) {
+            size_t len = alpha_run(s + i + 1);
+            if (len) {
+                /* \frac{a}{b} -> a/b (groups rendered recursively) */
+                if (len == 4 && memcmp(s + i + 1, "frac", 4) == 0) {
+                    size_t j = i + 5, st1, sk1, st2, sk2;
+                    size_t l1 = script_operand(s + j, n - j, &st1, &sk1);
+                    size_t j2 = j + l1 + sk1;
+                    size_t l2 = script_operand(s + j2, n - j2, &st2, &sk2);
+                    if (l1 && l2) {
+                        char *a = latex_render(s + j + st1, l1);
+                        char *b = latex_render(s + j2 + st2, l2);
+                        /* Parenthesize compound halves so "x+1 over 2"
+                         * doesn't flatten misleadingly to x+1/2. */
+                        bool pa = a && strpbrk(a, "+- ");
+                        bool pb = b && strpbrk(b, "+- ");
+                        if (a) {
+                            if (pa) buf_append_str(&out, "(");
+                            buf_append_str(&out, a);
+                            if (pa) buf_append_str(&out, ")");
+                        }
+                        buf_append_str(&out, "/");
+                        if (b) {
+                            if (pb) buf_append_str(&out, "(");
+                            buf_append_str(&out, b);
+                            if (pb) buf_append_str(&out, ")");
+                        }
+                        free(a);
+                        free(b);
+                        i = j2 + l2 + sk2;
+                        continue;
+                    }
+                }
+                const char *rep = latex_lookup(s + i + 1, len);
+                if (rep) {
+                    buf_append_str(&out, rep);
+                    i += len + 1;
+                } else {
+                    /* Unknown command: keep it verbatim, losslessly —
+                     * including its brace group, so \mathbb{R} survives
+                     * intact rather than degrading to \mathbbR. */
+                    buf_append(&out, s + i, len + 1);
+                    i += len + 1;
+                    if (i < n && s[i] == '{') {
+                        const char *cl = memchr(s + i, '}', n - i);
+                        size_t glen = cl ? (size_t)(cl - (s + i)) + 1 : 1;
+                        buf_append(&out, s + i, glen);
+                        i += glen;
+                    }
+                }
+                continue;
+            }
+            /* Escaped punctuation / spacing commands. */
+            char e = s[i + 1];
+            if (e == ',' || e == ';' || e == ':')
+                buf_append_str(&out, " ");
+            else if (e != '!')
+                buf_append(&out, &e, 1);
+            i += 2;
+            continue;
+        }
+
+        if (c == '^' || c == '_') {
+            size_t st, sk;
+            size_t len = script_operand(s + i + 1, n - i - 1, &st, &sk);
+            if (len) {
+                char *inner = latex_render(s + i + 1 + st, len);
+                if (inner) {
+                    char *sc = to_script(inner, c == '^');
+                    if (sc)
+                        buf_append_str(&out, sc);
+                    free(sc);
+                    free(inner);
+                }
+                i += 1 + len + sk;
+                continue;
+            }
+        }
+
+        if (c == '{' || c == '}') {
+            i++;
+            continue;
+        }
+
+        buf_append(&out, &c, 1);
+        i++;
+    }
+    buf_append(&out, nullptr, 0);       /* ensure NUL even when empty */
+    return out.data;
+}
+
+/* ------------------------------------------------------------------ */
 /* Rich inline text (strikethrough, marks, scripts, autolinks)         */
 /* ------------------------------------------------------------------ */
 
@@ -349,6 +544,39 @@ static void put_text_rich(Renderer *r, const char *s)
                                       (size_t)(close - (s + i + 1)));
                 if (inner) { put_scripted(r, inner, 1); free(inner); }
                 i = (size_t)(close - s) + 1;
+                continue;
+            }
+        }
+        if (c == '$') {                       /* $math$ / $$math$$ */
+            size_t open = s[i + 1] == '$' ? 2 : 1;
+            const char *inner = s + i + open;
+            const char *close = nullptr;
+            for (const char *p = inner; *p && *p != '\n'; p++) {
+                if (p[0] == '$' && (open == 1 || p[1] == '$')) {
+                    close = p;
+                    break;
+                }
+            }
+            /* Reject spans that look like prices ("$5 and $10"): inline
+             * math must not have spaces hugging its delimiters. */
+            if (close && close > inner &&
+                (open == 2 ||
+                 (inner[0] != ' ' && close[-1] != ' '))) {
+                char *tx = latex_render(inner, (size_t)(close - inner));
+                if (tx) {
+                    put_text(r, tx);
+                    free(tx);
+                }
+                i = (size_t)(close - s) + open;
+                continue;
+            }
+        }
+        if (c == '\\') {                      /* bare \rightarrow etc. */
+            size_t len = alpha_run(s + i + 1);
+            const char *rep = len ? latex_lookup(s + i + 1, len) : nullptr;
+            if (rep && *rep) {
+                put_text(r, rep);
+                i += len + 1;
                 continue;
             }
         }
