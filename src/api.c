@@ -25,6 +25,16 @@
 constexpr long ORC_TIMEOUT_SECS = 300;
 
 /*
+ * App attribution (https://openrouter.ai/docs/app-attribution): the
+ * Referer URL is the app's primary identifier in OpenRouter's activity
+ * logs and rankings — without it usage shows as "Unknown" — and the
+ * title sets the display name.
+ */
+#define ORC_ATTRIB_REFERER \
+    "HTTP-Referer: https://github.com/abhignan-rakshith/my-openrouter-client"
+#define ORC_ATTRIB_TITLE "X-OpenRouter-Title: orc"
+
+/*
  * Route a diagnostic to stderr, or into the caller's error sink when
  * one was supplied — callers streaming on the alternate screen collect
  * errors there and print them once the real screen is back, since
@@ -337,18 +347,23 @@ int or_chat(const OrRequest *req, char **reply)
         return -1;
     }
 
-    struct curl_slist *headers = curl_slist_append(nullptr, auth_header);
-    struct curl_slist *ct = headers
-        ? curl_slist_append(headers, "Content-Type: application/json")
-        : nullptr;
-    if (!ct) {
+    struct curl_slist *headers = nullptr, *h = nullptr;
+    static const char *const fixed[] = {
+        "Content-Type: application/json",
+        ORC_ATTRIB_REFERER,
+        ORC_ATTRIB_TITLE,
+    };
+    h = curl_slist_append(headers, auth_header);
+    for (size_t i = 0; h && i < sizeof fixed / sizeof *fixed; i++)
+        h = curl_slist_append(headers = h, fixed[i]);
+    if (!h) {
         emit_error(req->errs, "error: out of memory\n");
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         buf_free(&body);
         return -1;
     }
-    headers = ct;
+    headers = h;
 
     Buffer      resp = {0};
     StreamState st   = {0};
