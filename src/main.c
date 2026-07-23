@@ -330,8 +330,19 @@ typedef struct { struct timespec last; bool started; } StreamPaint;
 /*
  * or_chat progress callback: repaint the alternate screen with the reply
  * rendered as Markdown so far. Throttled to ~60ms so a fast token stream
- * doesn't thrash the terminal; the cursor is homed before each frame and
- * the area below it cleared, so every repaint overwrites the last in place.
+ * doesn't thrash the terminal.
+ *
+ * Each frame clears the whole screen and redraws from the top. Merely
+ * homing and overwriting the previous frame is not enough: once the
+ * reply outgrows the terminal, printing it scrolls the alt screen, so
+ * "home" no longer matches the document top and subsequent frames land
+ * misaligned over stale rows (spliced/duplicated lines). The clear
+ * makes residue impossible — a reply taller than the screen simply
+ * scrolls so its tail (the newest text) stays visible. The frame is
+ * bracketed in the synchronized-update protocol (ESC[?2026h/l) so
+ * terminals that support it apply clear+redraw atomically, without
+ * flicker; others ignore the sequences and just redraw fast.
+ *
  * Partial constructs (an unclosed **bold**, a half-finished list) simply
  * settle as more text arrives — the nature of rendering Markdown live.
  */
@@ -349,10 +360,11 @@ static void stream_repaint(const char *reply, void *user)
     sp->last = now;
     sp->started = true;
 
-    fputs("\033[H", stdout);            /* home to top-left of alt screen */
+    fputs("\033[?2026h", stdout);       /* begin synchronized update */
+    fputs("\033[2J\033[H", stdout);     /* clear all, then home */
     print_assistant_banner();
     md_render(reply, md_color_enabled());
-    fputs("\033[0J", stdout);           /* clear any taller previous frame */
+    fputs("\033[?2026l", stdout);       /* end synchronized update */
     fflush(stdout);
 }
 
