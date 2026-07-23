@@ -1,6 +1,6 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -std=c23
-CFLAGS  += -D_POSIX_C_SOURCE=200809L -pthread \
+CFLAGS  += -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -pthread \
            $(shell pkg-config --cflags libcurl libcmark)
 LDFLAGS += -pthread
 LDLIBS   = $(shell pkg-config --libs libcurl libcmark)
