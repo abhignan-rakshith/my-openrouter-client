@@ -87,6 +87,8 @@ static void usage(const char *prog)
         "reply renders live as Markdown as it streams.\n"
         "In the chat, /rename NAME renames the conversation.\n"
         "/quit (or Ctrl-D) ends the session.\n"
+        "\\+Enter (or Shift+Enter in supporting terminals) starts a new\n"
+        "line without sending, for multi-line messages.\n"
         "Ctrl+V pastes an image from the clipboard ([Image N] placeholder);\n"
         "it is sent as multimodal content to vision-capable models.\n"
         "\n"
@@ -645,8 +647,10 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
     printf("Chatting with %s — /quit or Ctrl-D to exit.\n", base->model);
     printf("Markdown: %s\n", base->markdown
            ? "on (rendered live as it streams)" : "off");
-    if (isatty(STDIN_FILENO))
+    if (isatty(STDIN_FILENO)) {
         printf("Ctrl+V pastes an image from the clipboard.\n");
+        printf("\\+Enter (or Shift+Enter) starts a new line.\n");
+    }
     if (path) {
         printf("Conversation: %s\n", path);
         if (items->len) {

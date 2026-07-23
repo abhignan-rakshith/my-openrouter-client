@@ -6,6 +6,10 @@
  * and a hook on Ctrl+V so the caller can pull an image off the OS
  * clipboard and splice a placeholder like "[Image 1]" into the line.
  *
+ * \+Enter — or Shift+Enter in terminals that encode it (CSI-u /
+ * modifyOtherKeys) — starts a new line instead of submitting, so a
+ * message may span several lines (joined with '\n' in the result).
+ *
  * When stdin is not a terminal the editor transparently falls back to
  * getline(), so piped input keeps working.
  */

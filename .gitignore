@@ -11,6 +11,9 @@
 # Local conversation history
 /conversations/
 
+# Claude Code guidance (local only)
+CLAUDE.md
+
 # macOS
 .DS_Store
 

@@ -6,6 +6,11 @@
  * with mbrtowc/wcwidth, and Ctrl+V routed to a caller-supplied hook.
  * ISIG stays enabled so Ctrl-C still delivers SIGINT; the fatal-signal
  * path restores the terminal via le_signal_restore().
+ *
+ * Multi-line input works shell-style: \+Enter (or Shift+Enter, where
+ * the terminal encodes it distinctly) commits the current line and
+ * continues on a "..." continuation line; committed lines are
+ * read-only. The returned string contains the embedded newlines.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -137,14 +142,20 @@ static size_t prompt_width(const char *p)
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    const char *prompt;
+    const char *prompt;  /* prompt for the current visual line */
     size_t      promptw;
     char       *buf;    /* NUL-terminated line being edited */
     size_t      len;
     size_t      cap;
     size_t      pos;    /* cursor, as a byte offset into buf */
     size_t      off;    /* first visible byte (horizontal scroll) */
+    size_t      start;  /* first byte of the current visual line: bytes
+                           before it (earlier lines ending in '\n') are
+                           committed and read-only */
 } Le;
+
+/* Prompt shown on continuation lines of a multi-line message. */
+#define LE_CONT_PROMPT "... "
 
 static size_t term_cols(void)
 {
@@ -232,10 +243,11 @@ static void delete_at(Le *le)
     le->buf[le->len] = '\0';
 }
 
-/* Delete the character before the cursor (Backspace). */
+/* Delete the character before the cursor (Backspace). Stops at the
+ * start of the current visual line: committed lines are read-only. */
 static void backspace(Le *le)
 {
-    if (le->pos == 0)
+    if (le->pos <= le->start)
         return;
     size_t p = ch_prev(le->buf, le->pos);
     memmove(le->buf + p, le->buf + le->pos, le->len - le->pos);
@@ -248,9 +260,9 @@ static void backspace(Le *le)
 static void kill_word(Le *le)
 {
     size_t p = le->pos;
-    while (p > 0 && le->buf[p - 1] == ' ')
+    while (p > le->start && le->buf[p - 1] == ' ')
         p--;
-    while (p > 0 && le->buf[p - 1] != ' ')
+    while (p > le->start && le->buf[p - 1] != ' ')
         p--;
     memmove(le->buf + p, le->buf + le->pos, le->len - le->pos);
     le->len -= le->pos - p;
@@ -258,37 +270,86 @@ static void kill_word(Le *le)
     le->buf[le->len] = '\0';
 }
 
-/* Consume an escape sequence and apply the cursor/delete keys we know. */
-static void handle_escape(Le *le)
+/*
+ * Commit a newline at the cursor: the line typed so far stays on
+ * screen, and editing continues on a fresh "..." continuation line
+ * below it. Text after the cursor moves down with it. Committed lines
+ * are read-only — the cursor cannot travel back above the newline
+ * (like a shell's PS2 continuation prompt).
+ */
+static void newline_commit(Le *le)
+{
+    if (insert_text(le, "\n", 1) != 0)
+        return;                         /* OOM: drop the keystroke */
+
+    /* Repaint the finished line without the tail, then drop below it. */
+    fputs("\r", stdout);
+    fputs(le->prompt, stdout);
+    fwrite(le->buf + le->off, 1, (le->pos - 1) - le->off, stdout);
+    fputs("\033[K\r\n", stdout);
+
+    le->start   = le->pos;
+    le->off     = le->pos;
+    le->prompt  = LE_CONT_PROMPT;
+    le->promptw = prompt_width(LE_CONT_PROMPT);
+    refresh(le);
+}
+
+/* What an escape sequence asked for beyond in-place cursor motion. */
+enum { ESC_NONE, ESC_NEWLINE };
+
+/* Consume an escape sequence and apply the cursor/delete keys we know.
+ * Returns ESC_NEWLINE when the sequence encodes Shift+Enter (or an
+ * ESC-prefixed Enter), which callers turn into a line continuation. */
+static int handle_escape(Le *le)
 {
     char s0, s1;
     if (read(STDIN_FILENO, &s0, 1) != 1)
-        return;
+        return ESC_NONE;
+    if (s0 == '\r' || s0 == '\n')       /* ESC+Enter (e.g. Alt+Enter) */
+        return ESC_NEWLINE;
     if (s0 != '[' && s0 != 'O')
-        return;
+        return ESC_NONE;
     if (read(STDIN_FILENO, &s1, 1) != 1)
-        return;
+        return ESC_NONE;
 
     if (s1 >= '0' && s1 <= '9') {
-        /* Extended sequence: swallow "<digits>(;<digits>)~". */
+        /* Extended sequence: collect "<digits>(;<digits>)*" + final. */
+        char params[16] = { s1 };
+        size_t np = 1;
         char c = 0;
         while (read(STDIN_FILENO, &c, 1) == 1) {
             if (!((c >= '0' && c <= '9') || c == ';'))
                 break;
+            if (np < sizeof params - 1)
+                params[np++] = c;
         }
-        if (s1 == '3' && c == '~')      /* Delete key */
+        params[np] = '\0';
+        if (c == '~' && strcmp(params, "3") == 0) {     /* Delete key */
             delete_at(le);
-        return;
+        } else if ((c == 'u' && strcmp(params, "13;2") == 0) ||
+                   (c == '~' && strcmp(params, "27;2;13") == 0)) {
+            /* Shift+Enter, from terminals speaking the CSI-u/kitty
+             * protocol ("ESC[13;2u") or xterm modifyOtherKeys
+             * ("ESC[27;2;13~"). Terminals that send a plain CR for
+             * Shift+Enter can't be told apart from Enter; \+Enter
+             * works everywhere. */
+            return ESC_NEWLINE;
+        }
+        return ESC_NONE;
     }
     switch (s1) {
     case 'C': if (le->pos < le->len)
                   le->pos += ch_len(le->buf + le->pos);
               break;                    /* right */
-    case 'D': le->pos = ch_prev(le->buf, le->pos); break;   /* left */
-    case 'H': le->pos = 0;        break;                    /* Home */
-    case 'F': le->pos = le->len;  break;                    /* End  */
+    case 'D': if (le->pos > le->start)
+                  le->pos = ch_prev(le->buf, le->pos);
+              break;                    /* left */
+    case 'H': le->pos = le->start; break;                   /* Home */
+    case 'F': le->pos = le->len;   break;                   /* End  */
     default:  break;                    /* up/down etc.: ignored */
     }
+    return ESC_NONE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -348,7 +409,13 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
         switch ((unsigned char)c) {
         case '\r':
         case '\n':
-            done = true;
+            if (le.pos > le.start && le.buf[le.pos - 1] == '\\') {
+                /* \+Enter: drop the backslash, continue on a new line. */
+                backspace(&le);
+                newline_commit(&le);
+            } else {
+                done = true;
+            }
             break;
         case 0x04:                      /* Ctrl-D */
             if (le.len == 0) {
@@ -364,16 +431,19 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
             backspace(&le);
             refresh(&le);
             break;
-        case 0x01: le.pos = 0;      refresh(&le); break;    /* Ctrl-A */
-        case 0x05: le.pos = le.len; refresh(&le); break;    /* Ctrl-E */
+        case 0x01: le.pos = le.start; refresh(&le); break;  /* Ctrl-A */
+        case 0x05: le.pos = le.len;   refresh(&le); break;  /* Ctrl-E */
         case 0x0b:                      /* Ctrl-K: kill to end */
             le.len = le.pos;
             le.buf[le.len] = '\0';
             refresh(&le);
             break;
-        case 0x15:                      /* Ctrl-U: kill line */
-            le.len = le.pos = 0;
-            le.buf[0] = '\0';
+        case 0x15:                      /* Ctrl-U: kill to line start */
+            memmove(le.buf + le.start, le.buf + le.pos,
+                    le.len - le.pos);
+            le.len -= le.pos - le.start;
+            le.pos  = le.start;
+            le.buf[le.len] = '\0';
             refresh(&le);
             break;
         case 0x17:                      /* Ctrl-W */
@@ -405,8 +475,10 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
             break;
         }
         case 0x1b:                      /* escape sequence */
-            handle_escape(&le);
-            refresh(&le);
+            if (handle_escape(&le) == ESC_NEWLINE)
+                newline_commit(&le);    /* Shift+Enter */
+            else
+                refresh(&le);
             break;
         default:
             if ((unsigned char)c >= 0x20) {
