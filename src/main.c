@@ -650,6 +650,7 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
     if (isatty(STDIN_FILENO)) {
         printf("Ctrl+V pastes an image from the clipboard.\n");
         printf("\\+Enter (or Shift+Enter) starts a new line.\n");
+        printf("Multi-line pastes show as [Pasted #N] and expand on send.\n");
     }
     if (path) {
         printf("Conversation: %s\n", path);

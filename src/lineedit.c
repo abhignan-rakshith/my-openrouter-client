@@ -11,6 +11,10 @@
  * the terminal encodes it distinctly) commits the current line and
  * continues on a "..." continuation line; committed lines are
  * read-only. The returned string contains the embedded newlines.
+ *
+ * Pastes arrive via bracketed paste mode: multi-line pastes are held
+ * back behind a "[Pasted #N +K lines]" placeholder and expanded into
+ * the returned string on submit.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -35,8 +39,12 @@ static volatile sig_atomic_t g_raw = 0;
 
 void le_signal_restore(void)
 {
-    if (g_raw)
+    if (g_raw) {
+        /* write(2) is async-signal-safe; leave bracketed paste mode. */
+        ssize_t r = write(STDOUT_FILENO, "\033[?2004l", 8);
+        (void)r;
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
+    }
 }
 
 static int raw_enable(void)
@@ -53,12 +61,19 @@ static int raw_enable(void)
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
         return -1;
+    /* Bracketed paste: the terminal wraps pasted text in ESC[200~ /
+     * ESC[201~, so a paste arrives as one unit instead of keystrokes
+     * (and embedded newlines don't submit the line). */
+    fputs("\033[?2004h", stdout);
+    fflush(stdout);
     g_raw = 1;
     return 0;
 }
 
 static void raw_disable(void)
 {
+    fputs("\033[?2004l", stdout);
+    fflush(stdout);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
     g_raw = 0;
 }
@@ -141,6 +156,16 @@ static size_t prompt_width(const char *p)
 /* Editor state and rendering                                          */
 /* ------------------------------------------------------------------ */
 
+/* One multi-line paste held back behind a "[Pasted #N ...]" tag. */
+typedef struct {
+    char  *text;    /* the pasted text (malloc'd) */
+    int    tag;     /* N in the placeholder      */
+    size_t lines;   /* line count shown in the placeholder */
+} LePaste;
+
+/* Most held-back pastes per prompt; later ones are inserted flattened. */
+constexpr size_t LE_MAX_PASTES = 16;
+
 typedef struct {
     const char *prompt;  /* prompt for the current visual line */
     size_t      promptw;
@@ -152,6 +177,9 @@ typedef struct {
     size_t      start;  /* first byte of the current visual line: bytes
                            before it (earlier lines ending in '\n') are
                            committed and read-only */
+    LePaste     pastes[LE_MAX_PASTES];  /* multi-line pastes held back */
+    size_t      npastes;
+    int         next_paste;             /* next [Pasted #N] number */
 } Le;
 
 /* Prompt shown on continuation lines of a multi-line message. */
@@ -296,7 +324,142 @@ static void newline_commit(Le *le)
 }
 
 /* What an escape sequence asked for beyond in-place cursor motion. */
-enum { ESC_NONE, ESC_NEWLINE };
+enum { ESC_NONE, ESC_NEWLINE, ESC_PASTE };
+
+/*
+ * Append one byte to a growable paste accumulator, keeping room for a
+ * NUL. Returns 0, or -1 on OOM (contents intact).
+ */
+static int paste_byte(char **d, size_t *len, size_t *cap, char c)
+{
+    if (*len + 1 >= *cap) {
+        size_t nc = *cap ? *cap * 2 : 256;
+        char *nb = realloc(*d, nc);
+        if (!nb)
+            return -1;
+        *d = nb;
+        *cap = nc;
+    }
+    (*d)[(*len)++] = c;
+    return 0;
+}
+
+/*
+ * Read the body of a bracketed paste (everything up to ESC[201~),
+ * normalizing CR/CRLF to '\n'. A single-line paste is inserted at the
+ * cursor verbatim. A multi-line paste is held back and represented by
+ * a "[Pasted #N +K lines]" placeholder, spliced back into the message
+ * on submit; deleting the placeholder discards the paste. On OOM the
+ * paste is consumed but dropped, so stray bytes never leak as input.
+ */
+static void paste_read(Le *le)
+{
+    static const char END[] = "\033[201~";
+    constexpr size_t ENDLEN = sizeof END - 1;
+
+    char *data = nullptr;
+    size_t len = 0, cap = 0, match = 0;
+    bool oom = false;
+    char prev = 0, c;
+
+    while (read(STDIN_FILENO, &c, 1) == 1) {
+        if (c == END[match]) {
+            if (++match == ENDLEN)
+                break;
+            continue;
+        }
+        /* Mismatch: the held-back terminator prefix was real content. */
+        for (size_t i = 0; i < match && !oom; i++)
+            oom = paste_byte(&data, &len, &cap, END[i]) != 0;
+        match = (c == END[0]) ? 1 : 0;
+        if (match)
+            continue;
+        if (c == '\n' && prev == '\r') {    /* CRLF: already emitted \n */
+            prev = c;
+            continue;
+        }
+        prev = c;
+        if (c == '\r')
+            c = '\n';
+        if (!oom)
+            oom = paste_byte(&data, &len, &cap, c) != 0;
+    }
+
+    if (oom || len == 0) {
+        free(data);
+        return;
+    }
+    data[len] = '\0';
+
+    size_t nl = 0;
+    for (size_t i = 0; i < len; i++)
+        if (data[i] == '\n')
+            nl++;
+
+    if (nl == 0) {                          /* single line: type it in */
+        insert_text(le, data, len);
+        free(data);
+        return;
+    }
+    if (le->npastes >= LE_MAX_PASTES) {
+        /* Out of slots: insert flattened so the display invariant
+         * (no '\n' in the editable segment) holds. */
+        for (size_t i = 0; i < len; i++)
+            if (data[i] == '\n')
+                data[i] = ' ';
+        insert_text(le, data, len);
+        free(data);
+        return;
+    }
+
+    size_t lines = nl + (data[len - 1] != '\n' ? 1 : 0);
+    char tag[48];
+    snprintf(tag, sizeof tag, "[Pasted #%d +%zu lines]",
+             le->next_paste, lines);
+    if (insert_text(le, tag, strlen(tag)) != 0) {
+        free(data);
+        return;
+    }
+    le->pastes[le->npastes++] = (LePaste){ .text  = data,
+                                           .tag   = le->next_paste,
+                                           .lines = lines };
+    le->next_paste++;
+}
+
+/*
+ * Replace each surviving "[Pasted #N ...]" placeholder in the finished
+ * line with its stored text (an edited-out placeholder discards that
+ * paste). Consumes le->buf and every stored paste; returns the
+ * malloc'd final line — le->buf itself when nothing needed expanding.
+ */
+static char *expand_pastes(Le *le)
+{
+    char *line = le->buf;
+    for (size_t i = 0; i < le->npastes; i++) {
+        LePaste *p = &le->pastes[i];
+        char tag[48];
+        snprintf(tag, sizeof tag, "[Pasted #%d +%zu lines]",
+                 p->tag, p->lines);
+        char *at = strstr(line, tag);
+        if (at) {
+            size_t taglen = strlen(tag), txtlen = strlen(p->text);
+            size_t linelen = strlen(line);
+            size_t pre = (size_t)(at - line);
+            char *nb = malloc(linelen - taglen + txtlen + 1);
+            if (nb) {
+                memcpy(nb, line, pre);
+                memcpy(nb + pre, p->text, txtlen);
+                memcpy(nb + pre + txtlen, at + taglen,
+                       linelen - pre - taglen + 1);
+                free(line);
+                line = nb;
+            }   /* OOM: leave the placeholder text in place */
+        }
+        free(p->text);
+    }
+    le->npastes = 0;
+    return line;
+}
 
 /* Consume an escape sequence and apply the cursor/delete keys we know.
  * Returns ESC_NEWLINE when the sequence encodes Shift+Enter (or an
@@ -325,7 +488,9 @@ static int handle_escape(Le *le)
                 params[np++] = c;
         }
         params[np] = '\0';
-        if (c == '~' && strcmp(params, "3") == 0) {     /* Delete key */
+        if (c == '~' && strcmp(params, "200") == 0) {
+            return ESC_PASTE;           /* bracketed paste follows */
+        } else if (c == '~' && strcmp(params, "3") == 0) {  /* Delete */
             delete_at(le);
         } else if ((c == 'u' && strcmp(params, "13;2") == 0) ||
                    (c == '~' && strcmp(params, "27;2;13") == 0)) {
@@ -379,10 +544,11 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
         return fallback_getline(prompt);
 
     Le le = {
-        .prompt  = prompt,
-        .promptw = prompt_width(prompt),
-        .buf     = malloc(128),
-        .cap     = 128,
+        .prompt     = prompt,
+        .promptw    = prompt_width(prompt),
+        .buf        = malloc(128),
+        .cap        = 128,
+        .next_paste = 1,
     };
     if (!le.buf) {
         raw_disable();
@@ -474,12 +640,18 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
             refresh(&le);
             break;
         }
-        case 0x1b:                      /* escape sequence */
-            if (handle_escape(&le) == ESC_NEWLINE)
+        case 0x1b: {                    /* escape sequence */
+            int esc = handle_escape(&le);
+            if (esc == ESC_NEWLINE) {
                 newline_commit(&le);    /* Shift+Enter */
-            else
+            } else if (esc == ESC_PASTE) {
+                paste_read(&le);
                 refresh(&le);
+            } else {
+                refresh(&le);
+            }
             break;
+        }
         default:
             if ((unsigned char)c >= 0x20) {
                 /* Pull in the continuation bytes of a UTF-8 character
@@ -502,8 +674,10 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
     fflush(stdout);
 
     if (eof) {
+        for (size_t i = 0; i < le.npastes; i++)
+            free(le.pastes[i].text);
         free(le.buf);
         return nullptr;
     }
-    return le.buf;
+    return expand_pastes(&le);
 }

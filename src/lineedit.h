@@ -10,6 +10,11 @@
  * modifyOtherKeys) — starts a new line instead of submitting, so a
  * message may span several lines (joined with '\n' in the result).
  *
+ * Bracketed paste is enabled while editing: a pasted block never
+ * submits the line. Multi-line pastes collapse to a "[Pasted #N +K
+ * lines]" placeholder and are spliced back into the returned string
+ * on submit; deleting the placeholder discards that paste.
+ *
  * When stdin is not a terminal the editor transparently falls back to
  * getline(), so piped input keeps working.
  */
