@@ -10,6 +10,7 @@
 #define ORC_API_H
 
 #define ORC_API_URL "https://openrouter.ai/api/v1/chat/completions"
+#define ORC_API_MODELS_URL "https://openrouter.ai/api/v1/models"
 
 /*
  * Streaming progress callback. Invoked during an SSE stream each time new
@@ -44,5 +45,15 @@ typedef struct {
  * newline.
  */
 int or_chat(const OrRequest *req, char **reply);
+
+/*
+ * Preflight: ask OpenRouter whether `model` accepts image input, by
+ * checking the model's advertised input modalities.
+ *
+ * Returns 1 if images are supported, 0 if not, -1 when the answer
+ * could not be determined (network error, unknown model). Performs a
+ * blocking HTTP GET; callers should cache the result per session.
+ */
+int or_model_supports_images(const char *api_key, const char *model);
 
 #endif /* ORC_API_H */

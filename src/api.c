@@ -299,3 +299,62 @@ int or_chat(const OrRequest *req, char **reply)
     buf_free(&st.reply);
     return result;
 }
+
+/* ------------------------------------------------------------------ */
+/* Model capability preflight                                          */
+/* ------------------------------------------------------------------ */
+
+int or_model_supports_images(const char *api_key, const char *model)
+{
+    /* Per-model endpoint metadata; small response, includes
+     * architecture.input_modalities. */
+    char url[512];
+    int n = snprintf(url, sizeof url, ORC_API_MODELS_URL "/%s/endpoints",
+                     model);
+    if (n < 0 || (size_t)n >= sizeof url)
+        return -1;
+
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return -1;
+
+    char auth_header[512];
+    int hn = snprintf(auth_header, sizeof auth_header,
+                      "Authorization: Bearer %s", api_key);
+    struct curl_slist *headers = (hn > 0 && (size_t)hn < sizeof auth_header)
+        ? curl_slist_append(nullptr, auth_header)
+        : nullptr;
+
+    Buffer resp = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    if (headers)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "orc/0.2 (native C)");
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    int result = -1;
+    if (rc == CURLE_OK && status == 200 && resp.data) {
+        const char *v = json_find_key(resp.data, "input_modalities");
+        const char *close = v && *v == '[' ? strchr(v, ']') : nullptr;
+        if (close) {
+            result = 0;
+            for (const char *p = v; p + 7 <= close; p++) {
+                if (strncmp(p, "\"image\"", 7) == 0) {
+                    result = 1;
+                    break;
+                }
+            }
+        }
+    }
+    buf_free(&resp);
+    return result;
+}

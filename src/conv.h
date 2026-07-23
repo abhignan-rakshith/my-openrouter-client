@@ -48,6 +48,17 @@ int conv_append(const char *path, const char *role, const char *content);
 int conv_items_add(Buffer *items, const char *role, const char *content);
 
 /*
+ * Variants of conv_append/conv_items_add whose `content_json` is an
+ * already-encoded JSON value (e.g. a multimodal content array of text
+ * and image_url parts). It is embedded verbatim as the message's
+ * "content". Return 0 on success.
+ */
+int conv_append_json(const char *path, const char *role,
+                     const char *content_json);
+int conv_items_add_json(Buffer *items, const char *role,
+                        const char *content_json);
+
+/*
  * Print an existing conversation to stdout in the same visual style as
  * the interactive prompt, so a resumed session shows its history.
  * A missing file is not an error. Returns 0 on success.

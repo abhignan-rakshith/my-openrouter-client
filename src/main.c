@@ -22,12 +22,19 @@
  *   /rename NAME  rename the current conversation
  *   /quit         end the session
  *
+ * Ctrl+V pastes an image from the clipboard into the prompt: the input
+ * shows a [Image N] placeholder and the image is sent alongside the
+ * text as multimodal content (vision-capable models only; support is
+ * checked against the OpenRouter model metadata on first paste).
+ *
  * Conversations are stored in conversations/<name>.jsonl, one
  * {"role":...,"content":...} object per line.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <locale.h>
 #include <signal.h>
@@ -35,8 +42,11 @@
 
 #include "api.h"
 #include "buffer.h"
+#include "clipboard.h"
 #include "config.h"
 #include "conv.h"
+#include "jsonutil.h"
+#include "lineedit.h"
 #include "md.h"
 #include "userconfig.h"
 
@@ -46,6 +56,12 @@
 constexpr size_t PATH_CAP = 512;
 /* Longest auto-generated conversation name (chat-YYYYMMDD-HHMMSS + slack). */
 constexpr size_t NAME_CAP = 64;
+
+/* Where pasted clipboard images are saved before being inlined. */
+#define ORC_ATTACH_DIR ORC_CONV_DIR "/attachments"
+
+/* Most images attachable to a single message. */
+constexpr size_t MAX_PENDING_IMAGES = 16;
 
 /* Parsed command-line options. */
 typedef struct {
@@ -71,6 +87,8 @@ static void usage(const char *prog)
         "reply renders live as Markdown as it streams.\n"
         "In the chat, /rename NAME renames the conversation.\n"
         "/quit (or Ctrl-D) ends the session.\n"
+        "Ctrl+V pastes an image from the clipboard ([Image N] placeholder);\n"
+        "it is sent as multimodal content to vision-capable models.\n"
         "\n"
         "Persistent settings (~/.config/orc/config, 0600):\n"
         "  %s config set key <API_KEY>     save the OpenRouter API key\n"
@@ -244,14 +262,11 @@ static void print_assistant_banner(void)
         fputs("assistant>\n", stdout);
 }
 
-/* Print the interactive "you>" prompt. */
-static void print_you_prompt(bool markdown)
+/* The interactive "you> " prompt string (color when appropriate). */
+static const char *you_prompt(bool markdown)
 {
-    if (markdown && md_color_enabled())
-        fputs("\n\033[1;38;5;84myou>\033[0m ", stdout);
-    else
-        fputs("\nyou> ", stdout);
-    fflush(stdout);
+    return (markdown && md_color_enabled())
+        ? "\033[1;38;5;84myou>\033[0m " : "you> ";
 }
 
 /* Enter / leave the terminal's alternate screen buffer. The alternate
@@ -289,6 +304,7 @@ static void on_fatal_signal(int sig)
         ssize_t r = write(STDOUT_FILENO, "\033[?1049l", 8);
         (void)r;
     }
+    le_signal_restore();    /* leave raw mode if the editor was active */
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -337,6 +353,154 @@ static void stream_repaint(const char *reply, void *user)
     fflush(stdout);
 }
 
+/* ------------------------------------------------------------------ */
+/* Clipboard image paste                                               */
+/* ------------------------------------------------------------------ */
+
+/* One clipboard image pasted but not yet sent. */
+typedef struct {
+    char *path;     /* saved PNG under ORC_ATTACH_DIR */
+    int   tag;      /* N of its "[Image N]" placeholder */
+} PendingImage;
+
+/* Paste state threaded through the line editor's Ctrl+V callback. */
+typedef struct {
+    const char  *api_key;
+    const char  *model;
+    int          support;   /* -2 unknown, 0 no, 1 yes (or assumed)    */
+    int          next_tag;  /* next [Image N] number, session-wide     */
+    PendingImage imgs[MAX_PENDING_IMAGES];
+    size_t       nimgs;
+} PasteCtx;
+
+/* Replace *msg (freeing any previous) with a formatted status line. */
+static void set_msg(char **msg, const char *fmt, const char *arg)
+{
+    free(*msg);
+    char buf[256];
+    snprintf(buf, sizeof buf, fmt, arg);
+    *msg = strdup(buf);
+}
+
+/*
+ * Ctrl+V handler: verify the model can take images (once, cached for
+ * the session), pull the clipboard image into the attachments dir, and
+ * hand the editor a "[Image N]" placeholder to splice into the line.
+ */
+static char *paste_cb(void *user, char **msg)
+{
+    PasteCtx *pc = user;
+    *msg = nullptr;
+
+    if (pc->support == -2) {
+        int s = or_model_supports_images(pc->api_key, pc->model);
+        if (s == -1) {
+            set_msg(msg, "warning: could not verify image support for "
+                         "model '%s'; sending anyway", pc->model);
+            s = 1;      /* optimistic: let the API be the judge */
+        }
+        pc->support = s;
+    }
+    if (pc->support == 0) {
+        set_msg(msg, "error: model '%s' does not support image input "
+                     "(try a vision model, e.g. " DEFAULT_MODEL ")",
+                pc->model);
+        return nullptr;
+    }
+    if (pc->nimgs >= MAX_PENDING_IMAGES) {
+        set_msg(msg, "error: too many images in one message%s", "");
+        return nullptr;
+    }
+
+    if (conv_ensure_dir() != 0 ||
+        (mkdir(ORC_ATTACH_DIR, 0755) != 0 && errno != EEXIST)) {
+        set_msg(msg, "error: cannot create %s/", ORC_ATTACH_DIR);
+        return nullptr;
+    }
+
+    char path[PATH_CAP];
+    snprintf(path, sizeof path, ORC_ATTACH_DIR "/img-%ld-%d.png",
+             (long)time(nullptr), pc->next_tag);
+    if (clip_image_save(path) != 0) {
+        set_msg(msg, "no image found on the clipboard%s", "");
+        return nullptr;
+    }
+
+    char *saved = strdup(path);
+    if (!saved) {
+        remove(path);
+        return nullptr;
+    }
+    pc->imgs[pc->nimgs] = (PendingImage){ .path = saved,
+                                          .tag = pc->next_tag };
+    pc->nimgs++;
+
+    char tagtxt[32];
+    snprintf(tagtxt, sizeof tagtxt, "[Image %d]", pc->next_tag);
+    pc->next_tag++;
+    return strdup(tagtxt);
+}
+
+/* Forget (but keep on disk) any images pasted for the current line. */
+static void clear_pending(PasteCtx *pc)
+{
+    for (size_t i = 0; i < pc->nimgs; i++)
+        free(pc->imgs[i].path);
+    pc->nimgs = 0;
+}
+
+/*
+ * Build a multimodal content array (JSON value) for `text` plus every
+ * pending image whose [Image N] placeholder still appears in the text
+ * (deleting the placeholder de-attaches the image). Returns a malloc'd
+ * JSON array, or NULL when no image is attached / on failure —
+ * distinguished via *oom.
+ */
+static char *build_mm_content(PasteCtx *pc, const char *text, bool *oom)
+{
+    *oom = false;
+    char *esc = json_escape(text);
+    if (!esc) {
+        *oom = true;
+        return nullptr;
+    }
+
+    Buffer out = {0};
+    bool bad = buf_append_str(&out, "[{\"type\":\"text\",\"text\":\"") ||
+               buf_append_str(&out, esc) ||
+               buf_append_str(&out, "\"}");
+    free(esc);
+
+    size_t attached = 0;
+    for (size_t i = 0; i < pc->nimgs && !bad; i++) {
+        char tagtxt[32];
+        snprintf(tagtxt, sizeof tagtxt, "[Image %d]", pc->imgs[i].tag);
+        if (!strstr(text, tagtxt))
+            continue;   /* placeholder edited out: don't send it */
+
+        char *url = clip_file_data_url(pc->imgs[i].path);
+        if (!url) {
+            fprintf(stderr, "warning: cannot read %s, skipping image\n",
+                    pc->imgs[i].path);
+            continue;
+        }
+        bad = buf_append_str(&out,
+                  ",{\"type\":\"image_url\",\"image_url\":{\"url\":\"") ||
+              buf_append_str(&out, url) ||
+              buf_append_str(&out, "\"}}");
+        free(url);
+        attached++;
+    }
+    bad = bad || buf_append_str(&out, "]");
+
+    if (bad || attached == 0) {
+        *oom = bad;
+        buf_free(&out);
+        return nullptr;
+    }
+    return out.data;    /* ownership moves to the caller */
+}
+
 /*
  * Run one exchange: append the user message to the in-memory history
  * (and file, if any), call the API with the full history, then record
@@ -346,16 +510,29 @@ static void stream_repaint(const char *reply, void *user)
  * the alternate screen for responsiveness; once complete that view is
  * dropped and the finished reply is re-drawn with Markdown styling on the
  * main screen, so only the formatted copy remains.
+ *
+ * `content_json`, when non-NULL, is a pre-encoded multimodal content
+ * array (text + images) recorded and sent in place of the plain
+ * user_msg string.
  */
 static int run_turn(const OrRequest *base, Buffer *items,
-                    const char *path, const char *user_msg)
+                    const char *path, const char *user_msg,
+                    const char *content_json)
 {
-    if (conv_items_add(items, "user", user_msg) != 0) {
+    int arc = content_json
+        ? conv_items_add_json(items, "user", content_json)
+        : conv_items_add(items, "user", user_msg);
+    if (arc != 0) {
         fprintf(stderr, "error: out of memory\n");
         return -1;
     }
-    if (path && conv_append(path, "user", user_msg) != 0)
-        return -1;
+    if (path) {
+        arc = content_json
+            ? conv_append_json(path, "user", content_json)
+            : conv_append(path, "user", user_msg);
+        if (arc != 0)
+            return -1;
+    }
 
     /* Wrap the accumulated items in a JSON array. */
     Buffer msgs = {0};
@@ -468,6 +645,8 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
     printf("Chatting with %s — /quit or Ctrl-D to exit.\n", base->model);
     printf("Markdown: %s\n", base->markdown
            ? "on (rendered live as it streams)" : "off");
+    if (isatty(STDIN_FILENO))
+        printf("Ctrl+V pastes an image from the clipboard.\n");
     if (path) {
         printf("Conversation: %s\n", path);
         if (items->len) {
@@ -486,36 +665,60 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
     if (repl_intro(base, items, path) != 0)
         return 1;
 
-    char *line = nullptr;
-    size_t cap = 0;
+    PasteCtx pc = {
+        .api_key  = base->api_key,
+        .model    = base->model,
+        .support  = -2,
+        .next_tag = 1,
+    };
+
     int status = 0;
     for (;;) {
-        print_you_prompt(base->markdown);
-
-        ssize_t n = getline(&line, &cap, stdin);
-        if (n == -1) { /* EOF */
+        putchar('\n');
+        char *line = le_readline(you_prompt(base->markdown),
+                                 paste_cb, &pc);
+        if (!line) { /* EOF */
             putchar('\n');
             break;
         }
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-            line[--n] = '\0';
-        if (n == 0)
+        if (!*line) {
+            free(line);
             continue;
+        }
 
-        if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0)
+        if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) {
+            free(line);
             break;
+        }
         if (is_command(line, "/rename", 7)) {
             handle_rename(line + 7, path, pathsz);
+            clear_pending(&pc);     /* pastes don't survive the command */
+            free(line);
+            continue;
+        }
+
+        /* Attach any pasted images whose placeholder survived editing. */
+        char *mm = nullptr;
+        bool oom = false;
+        if (pc.nimgs)
+            mm = build_mm_content(&pc, line, &oom);
+        clear_pending(&pc);
+        if (oom) {
+            fprintf(stderr, "error: out of memory\n");
+            free(line);
+            status = 1;
             continue;
         }
 
         putchar('\n');
-        if (run_turn(base, items, path, line) != 0) {
+        if (run_turn(base, items, path, line, mm) != 0) {
             /* Report and keep the session alive; the user may retry. */
             status = 1;
         }
+        free(mm);
+        free(line);
     }
-    free(line);
+    clear_pending(&pc);
     return status;
 }
 
@@ -624,7 +827,7 @@ int main(int argc, char **argv)
 
     int status;
     if (opts.prompt)
-        status = run_turn(&base, &items, path, opts.prompt) ? 1 : 0;
+        status = run_turn(&base, &items, path, opts.prompt, nullptr) ? 1 : 0;
     else
         status = repl(&base, &items, path, sizeof pathbuf);
 

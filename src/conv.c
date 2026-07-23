@@ -60,13 +60,15 @@ static ssize_t read_line_trimmed(FILE *f, char **line, size_t *cap)
 
 /*
  * Sanity-check that a line looks like a message object before it is
- * replayed to the API: it must parse as {"role": "...", "content": "..."}.
+ * replayed to the API: it must have a string "role" and a "content"
+ * that is either a string or a multimodal parts array.
  */
 static bool line_is_message(const char *line)
 {
     const char *role = json_find_key(line, "role");
     const char *content = json_find_key(line, "content");
-    return role && *role == '"' && content && *content == '"';
+    return role && *role == '"' &&
+           content && (*content == '"' || *content == '[');
 }
 
 int conv_load(const char *path, Buffer *items)
@@ -111,7 +113,20 @@ int conv_load(const char *path, Buffer *items)
     return rc;
 }
 
-/* Render one {"role":...,"content":...} object into a Buffer. */
+/* Render {"role":...,"content":...} with an already-encoded JSON value
+ * (string literal or parts array) as the content. */
+static int render_message_json(Buffer *out, const char *role,
+                               const char *content_json)
+{
+    bool bad = buf_append_str(out, "{\"role\":\"")    ||
+               buf_append_str(out, role)              ||
+               buf_append_str(out, "\",\"content\":") ||
+               buf_append_str(out, content_json)      ||
+               buf_append_str(out, "}");
+    return bad ? -1 : 0;
+}
+
+/* Render one {"role":...,"content":"..."} object into a Buffer. */
 static int render_message(Buffer *out, const char *role, const char *content)
 {
     char *esc = json_escape(content);
@@ -126,25 +141,18 @@ static int render_message(Buffer *out, const char *role, const char *content)
     return bad ? -1 : 0;
 }
 
-int conv_append(const char *path, const char *role, const char *content)
+/* Write one rendered message line to the conversation file. */
+static int append_line(const char *path, const Buffer *msg)
 {
-    Buffer msg = {0};
-    if (render_message(&msg, role, content) != 0) {
-        fprintf(stderr, "error: out of memory\n");
-        buf_free(&msg);
-        return -1;
-    }
-
     FILE *f = fopen(path, "a");
     if (!f) {
         fprintf(stderr, "error: cannot append to %s: %s\n",
                 path, strerror(errno));
-        buf_free(&msg);
         return -1;
     }
 
     int rc = 0;
-    if (fprintf(f, "%s\n", msg.data) < 0 || fflush(f) != 0) {
+    if (fprintf(f, "%s\n", msg->data) < 0 || fflush(f) != 0) {
         fprintf(stderr, "error: write failed on %s: %s\n",
                 path, strerror(errno));
         rc = -1;
@@ -154,6 +162,32 @@ int conv_append(const char *path, const char *role, const char *content)
                 path, strerror(errno));
         rc = -1;
     }
+    return rc;
+}
+
+int conv_append(const char *path, const char *role, const char *content)
+{
+    Buffer msg = {0};
+    if (render_message(&msg, role, content) != 0) {
+        fprintf(stderr, "error: out of memory\n");
+        buf_free(&msg);
+        return -1;
+    }
+    int rc = append_line(path, &msg);
+    buf_free(&msg);
+    return rc;
+}
+
+int conv_append_json(const char *path, const char *role,
+                     const char *content_json)
+{
+    Buffer msg = {0};
+    if (render_message_json(&msg, role, content_json) != 0) {
+        fprintf(stderr, "error: out of memory\n");
+        buf_free(&msg);
+        return -1;
+    }
+    int rc = append_line(path, &msg);
     buf_free(&msg);
     return rc;
 }
@@ -163,6 +197,14 @@ int conv_items_add(Buffer *items, const char *role, const char *content)
     if (items->len && buf_append_str(items, ",") != 0)
         return -1;
     return render_message(items, role, content);
+}
+
+int conv_items_add_json(Buffer *items, const char *role,
+                        const char *content_json)
+{
+    if (items->len && buf_append_str(items, ",") != 0)
+        return -1;
+    return render_message_json(items, role, content_json);
 }
 
 /* Print one already-decoded message in the interactive prompt's style. */
@@ -208,9 +250,16 @@ int conv_show(const char *path, int markdown)
         const char *content_value = json_find_key(line, "content");
         char *role = role_value && *role_value == '"'
                          ? json_decode_string(role_value, nullptr) : nullptr;
-        char *content = content_value && *content_value == '"'
-                            ? json_decode_string(content_value, nullptr)
-                            : nullptr;
+        char *content = nullptr;
+        if (content_value && *content_value == '"') {
+            content = json_decode_string(content_value, nullptr);
+        } else if (content_value && *content_value == '[') {
+            /* Multimodal parts array: show the text part, which carries
+             * the [Image N] markers for any attached images. */
+            const char *t = json_find_key(content_value, "text");
+            if (t && *t == '"')
+                content = json_decode_string(t, nullptr);
+        }
         if (role && content)
             show_message(role, content, markdown);
         free(role);
