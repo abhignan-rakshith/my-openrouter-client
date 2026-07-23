@@ -182,6 +182,8 @@ constexpr size_t LE_MAX_PASTES = 16;
 typedef struct {
     const char *prompt;  /* prompt for the current visual line */
     size_t      promptw;
+    const char *prompt0; /* the primary prompt, for history recall */
+    size_t      promptw0;
     char       *buf;    /* NUL-terminated line being edited */
     size_t      len;
     size_t      cap;
@@ -193,7 +195,37 @@ typedef struct {
     LePaste     pastes[LE_MAX_PASTES];  /* multi-line pastes held back */
     size_t      npastes;
     int         next_paste;             /* next [Pasted #N] number */
+    size_t      hidx;   /* history cursor; g_nhist = "not browsing" */
+    char       *hsave;  /* in-progress line stashed while browsing */
 } Le;
+
+/* ------------------------------------------------------------------ */
+/* Session history                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Submitted messages, oldest first, for Up/Down recall. Session-only. */
+static char  **g_hist;
+static size_t  g_nhist, g_histcap;
+
+/* Record a submitted message (consecutive duplicates are skipped). */
+static void hist_add(const char *line)
+{
+    if (!line || !*line)
+        return;
+    if (g_nhist && strcmp(g_hist[g_nhist - 1], line) == 0)
+        return;
+    if (g_nhist == g_histcap) {
+        size_t nc = g_histcap ? g_histcap * 2 : 32;
+        char **nh = realloc(g_hist, nc * sizeof *nh);
+        if (!nh)
+            return;             /* OOM: just don't record it */
+        g_hist = nh;
+        g_histcap = nc;
+    }
+    char *dup = strdup(line);
+    if (dup)
+        g_hist[g_nhist++] = dup;
+}
 
 /* Prompt shown on continuation lines of a multi-line message. */
 #define LE_CONT_PROMPT "... "
@@ -334,6 +366,66 @@ static void newline_commit(Le *le)
     le->prompt  = LE_CONT_PROMPT;
     le->promptw = prompt_width(LE_CONT_PROMPT);
     refresh(le);
+}
+
+/*
+ * Replace the entire edit buffer (committed lines included) with
+ * `text` and repaint. Every committed line occupies exactly one
+ * terminal row (windows are clipped, never wrapped), so the block is
+ * erased by moving up one row per '\n' and clearing downward; the
+ * replacement is then replayed through newline_commit so multi-line
+ * history entries rebuild their continuation lines. Used by history
+ * recall.
+ */
+static void set_buffer(Le *le, const char *text)
+{
+    size_t rows = 0;
+    for (size_t i = 0; i < le->len; i++)
+        if (le->buf[i] == '\n')
+            rows++;
+    fputs("\r", stdout);
+    if (rows)
+        fprintf(stdout, "\033[%zuA", rows);
+    fputs("\033[J", stdout);
+
+    le->len = le->pos = le->off = le->start = 0;
+    le->buf[0]  = '\0';
+    le->prompt  = le->prompt0;
+    le->promptw = le->promptw0;
+
+    for (const char *p = text, *nl; ; p = nl + 1) {
+        nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        insert_text(le, p, n);
+        if (!nl)
+            break;
+        refresh(le);            /* settle the window before committing */
+        newline_commit(le);
+    }
+    refresh(le);
+}
+
+/* Recall the previous (dir < 0) or next (dir > 0) history entry. The
+ * in-progress line is stashed on first Up and restored past the end. */
+static void hist_recall(Le *le, int dir)
+{
+    if (dir < 0) {
+        if (le->hidx == 0)
+            return;
+        if (le->hidx == g_nhist) {      /* leaving the live line */
+            free(le->hsave);
+            le->hsave = strdup(le->buf);
+        }
+        le->hidx--;
+        set_buffer(le, g_hist[le->hidx]);
+    } else {
+        if (le->hidx >= g_nhist)
+            return;
+        le->hidx++;
+        set_buffer(le, le->hidx == g_nhist
+                       ? (le->hsave ? le->hsave : "")
+                       : g_hist[le->hidx]);
+    }
 }
 
 /* What an escape sequence asked for beyond in-place cursor motion. */
@@ -517,6 +609,8 @@ static int handle_escape(Le *le)
         return ESC_NONE;
     }
     switch (s1) {
+    case 'A': hist_recall(le, -1); break;                   /* Up   */
+    case 'B': hist_recall(le, +1); break;                   /* Down */
     case 'C': if (le->pos < le->len)
                   le->pos += ch_len(le->buf + le->pos);
               break;                    /* right */
@@ -525,7 +619,7 @@ static int handle_escape(Le *le)
               break;                    /* left */
     case 'H': le->pos = le->start; break;                   /* Home */
     case 'F': le->pos = le->len;   break;                   /* End  */
-    default:  break;                    /* up/down etc.: ignored */
+    default:  break;
     }
     return ESC_NONE;
 }
@@ -559,10 +653,13 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
     Le le = {
         .prompt     = prompt,
         .promptw    = prompt_width(prompt),
+        .prompt0    = prompt,
         .buf        = malloc(128),
         .cap        = 128,
         .next_paste = 1,
+        .hidx       = g_nhist,
     };
+    le.promptw0 = le.promptw;
     if (!le.buf) {
         raw_disable();
         return fallback_getline(prompt);
@@ -686,11 +783,14 @@ char *le_readline(const char *prompt, LePasteCb on_paste, void *paste_user)
     fputs("\n", stdout);
     fflush(stdout);
 
+    free(le.hsave);
     if (eof) {
         for (size_t i = 0; i < le.npastes; i++)
             free(le.pastes[i].text);
         free(le.buf);
         return nullptr;
     }
-    return expand_pastes(&le);
+    char *out = expand_pastes(&le);
+    hist_add(out);
+    return out;
 }

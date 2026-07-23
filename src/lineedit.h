@@ -15,6 +15,10 @@
  * lines]" placeholder and are spliced back into the returned string
  * on submit; deleting the placeholder discards that paste.
  *
+ * Up/Down cycle through the messages submitted this session; the
+ * in-progress line is stashed while browsing and restored when
+ * cycling back past the newest entry.
+ *
  * When stdin is not a terminal the editor transparently falls back to
  * getline(), so piped input keeps working.
  */

@@ -705,6 +705,7 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
         printf("\\+Enter (or Shift+Enter) starts a new line.\n");
         printf("Multi-line pastes show as [Pasted #N] and expand on send.\n");
         printf("Esc interrupts a reply, keeping the partial text.\n");
+        printf("Up/Down cycle through your message history.\n");
     }
     if (path) {
         printf("Conversation: %s\n", path);
