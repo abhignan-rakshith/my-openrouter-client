@@ -274,6 +274,53 @@ int conv_show(const char *path, int markdown)
     return rc;
 }
 
+/* Decode a line's "content" (string or multimodal text part) to plain
+ * text, or nullptr if it has none. */
+static char *decode_content(const char *line)
+{
+    const char *content_value = json_find_key(line, "content");
+    if (!content_value)
+        return nullptr;
+    if (*content_value == '"')
+        return json_decode_string(content_value, nullptr);
+    if (*content_value == '[') {
+        const char *t = json_find_key(content_value, "text");
+        if (t && *t == '"')
+            return json_decode_string(t, nullptr);
+    }
+    return nullptr;
+}
+
+char *conv_last_reply(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return nullptr;     /* missing file: nothing to recall */
+
+    char *line = nullptr;
+    size_t cap = 0;
+    ssize_t n;
+    char *last = nullptr;
+    while ((n = read_line_trimmed(f, &line, &cap)) != -1) {
+        if (n == 0)
+            continue;
+        const char *role_value = json_find_key(line, "role");
+        char *role = role_value && *role_value == '"'
+                         ? json_decode_string(role_value, nullptr) : nullptr;
+        if (role && strcmp(role, "assistant") == 0) {
+            char *content = decode_content(line);
+            if (content) {
+                free(last);         /* keep only the most recent */
+                last = content;
+            }
+        }
+        free(role);
+    }
+    free(line);
+    fclose(f);
+    return last;
+}
+
 int conv_rename(const char *oldpath, const char *newpath)
 {
     if (strcmp(oldpath, newpath) == 0)

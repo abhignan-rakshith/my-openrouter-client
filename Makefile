@@ -11,7 +11,8 @@ PREFIX  ?= $(HOME)/.local
 BINDIR  := $(PREFIX)/bin
 
 SRC := src/main.c src/api.c src/conv.c src/jsonutil.c src/config.c src/buffer.c \
-       src/spinner.c src/md.c src/userconfig.c src/lineedit.c src/clipboard.c
+       src/spinner.c src/md.c src/userconfig.c src/lineedit.c src/clipboard.c \
+       src/save.c
 OBJ := $(SRC:.c=.o)
 HDR := $(wildcard src/*.h)
 

@@ -20,6 +20,7 @@
  *
  * Interactive commands:
  *   /rename NAME  rename the current conversation
+ *   /save [NAME]  export the last reply to saves/<name>.md
  *   /quit         end the session
  *
  * Ctrl+V pastes an image from the clipboard into the prompt: the input
@@ -48,6 +49,7 @@
 #include "jsonutil.h"
 #include "lineedit.h"
 #include "md.h"
+#include "save.h"
 #include "userconfig.h"
 
 #define DEFAULT_MODEL "google/gemini-3.6-flash"
@@ -85,7 +87,8 @@ static void usage(const char *prog)
         "\n"
         "With no prompt, an interactive chat session starts. In a terminal the\n"
         "reply renders live as Markdown as it streams.\n"
-        "In the chat, /rename NAME renames the conversation.\n"
+        "In the chat, /rename NAME renames the conversation and\n"
+        "/save [NAME] exports the last reply to saves/<name>.md.\n"
         "/quit (or Ctrl-D) ends the session.\n"
         "\\+Enter (or Shift+Enter in supporting terminals) starts a new\n"
         "line without sending, for multi-line messages.\n"
@@ -436,8 +439,17 @@ static char *paste_cb(void *user, char **msg)
     char path[PATH_CAP];
     snprintf(path, sizeof path, ORC_ATTACH_DIR "/img-%ld-%d.png",
              (long)time(nullptr), pc->next_tag);
-    if (clip_image_save(path) != 0) {
-        set_msg(msg, "no image found on the clipboard%s", "");
+    int shot = clip_image_save(path);
+    if (shot != 0) {
+        if (shot < 0)
+#if defined(__APPLE__)
+            set_msg(msg, "error: could not read the clipboard%s", "");
+#else
+            set_msg(msg, "error: no clipboard helper found "
+                         "(install wl-clipboard or xclip)%s", "");
+#endif
+        else
+            set_msg(msg, "no image found on the clipboard%s", "");
         return nullptr;
     }
 
@@ -551,10 +563,15 @@ static void rollback_turn(Buffer *items, size_t len0,
  * `content_json`, when non-NULL, is a pre-encoded multimodal content
  * array (text + images) recorded and sent in place of the plain
  * user_msg string.
+ *
+ * `out_reply`, when non-NULL, receives ownership of the assistant's reply
+ * string on success (any previous *out_reply is freed first), so the
+ * caller can retain the most recent reply — e.g. for /save. On failure it
+ * is left untouched. When NULL the reply is simply freed.
  */
 static int run_turn(const OrRequest *base, Buffer *items,
                     const char *path, const char *user_msg,
-                    const char *content_json)
+                    const char *content_json, char **out_reply)
 {
     /* Snapshot the history so a failed exchange can be rolled back. */
     size_t len0   = items->len;
@@ -657,7 +674,12 @@ static int run_turn(const OrRequest *base, Buffer *items,
     } else if (path && conv_append(path, "assistant", reply) != 0) {
         rc = -1;
     }
-    free(reply);
+    if (out_reply) {
+        free(*out_reply);       /* drop the previous turn's retained reply */
+        *out_reply = reply;     /* hand ownership to the caller           */
+    } else {
+        free(reply);
+    }
     return rc;
 }
 
@@ -705,6 +727,39 @@ static void handle_rename(char *args, char *path, size_t pathsz)
     printf("Conversation renamed to %s\n", path);
 }
 
+/*
+ * Handle the /save command. `args` points just past "/save"; an optional
+ * name follows, otherwise a timestamped default is used. Writes the last
+ * assistant reply to saves/<name>.md. `last_reply` is NULL when no reply
+ * has been received yet this session.
+ */
+static void handle_save(char *args, const char *last_reply)
+{
+    if (!last_reply) {
+        fprintf(stderr, "Nothing to save yet — no reply this session.\n");
+        return;
+    }
+
+    char namebuf[NAME_CAP];
+    char *name = skip_ws(args);
+    if (!*name) {
+        time_t now = time(nullptr);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(namebuf, sizeof namebuf, "reply-%Y%m%d-%H%M%S", &tm);
+        name = namebuf;
+    }
+
+    char path[PATH_CAP];
+    if (save_path(name, path, sizeof path) != 0) {
+        fprintf(stderr, "error: invalid save name '%s'\n", name);
+        return;
+    }
+    if (save_ensure_dir() != 0 || save_write(path, last_reply) != 0)
+        return;
+    printf("Saved reply to %s\n", path);
+}
+
 /* Print the session header, and prior history when resuming. */
 static int repl_intro(const OrRequest *base, const Buffer *items,
                       const char *path)
@@ -718,6 +773,7 @@ static int repl_intro(const OrRequest *base, const Buffer *items,
         printf("Multi-line pastes show as [Pasted #N] and expand on send.\n");
         printf("Esc interrupts a reply, keeping the partial text.\n");
         printf("Up/Down cycle through your message history.\n");
+        printf("/save [NAME] writes the last reply to saves/<name>.md.\n");
     }
     if (path) {
         printf("Conversation: %s\n", path);
@@ -744,6 +800,9 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
         .next_tag = 1,
     };
 
+    /* Seed from disk so /save works on a resumed conversation, not just
+     * after a fresh turn this session. */
+    char *last_reply = path ? conv_last_reply(path) : nullptr;
     int status = 0;
     for (;;) {
         putchar('\n');
@@ -768,6 +827,12 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
             free(line);
             continue;
         }
+        if (is_command(line, "/save", 5)) {
+            handle_save(line + 5, last_reply);
+            clear_pending(&pc);     /* pastes don't survive the command */
+            free(line);
+            continue;
+        }
 
         /* Attach any pasted images whose placeholder survived editing. */
         char *mm = nullptr;
@@ -783,7 +848,7 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
         }
 
         putchar('\n');
-        if (run_turn(base, items, path, line, mm) != 0) {
+        if (run_turn(base, items, path, line, mm, &last_reply) != 0) {
             /* Report and keep the session alive; the user may retry. */
             status = 1;
         }
@@ -791,6 +856,7 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
         free(line);
     }
     clear_pending(&pc);
+    free(last_reply);
     return status;
 }
 
@@ -899,7 +965,7 @@ int main(int argc, char **argv)
 
     int status;
     if (opts.prompt)
-        status = run_turn(&base, &items, path, opts.prompt, nullptr) ? 1 : 0;
+        status = run_turn(&base, &items, path, opts.prompt, nullptr, nullptr) ? 1 : 0;
     else
         status = repl(&base, &items, path, sizeof pathbuf);
 

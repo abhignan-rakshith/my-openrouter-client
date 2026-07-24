@@ -66,6 +66,14 @@ int conv_items_add_json(Buffer *items, const char *role,
 int conv_show(const char *path, int markdown);
 
 /*
+ * Return a malloc'd copy of the last assistant reply's text in the
+ * conversation, decoded to plain text (for a multimodal message, the
+ * text part). Returns nullptr if the file is missing, has no assistant
+ * message, or on error. The caller frees the result.
+ */
+char *conv_last_reply(const char *path);
+
+/*
  * Rename a conversation file from oldpath to newpath. If oldpath does
  * not exist yet (no messages written), this succeeds so the caller can
  * simply adopt newpath. Refuses to overwrite an existing newpath.

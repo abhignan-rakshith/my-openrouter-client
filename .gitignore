@@ -11,6 +11,9 @@
 # Local conversation history
 /conversations/
 
+# Saved replies
+/saves/
+
 # Claude Code guidance (local only)
 CLAUDE.md
 
