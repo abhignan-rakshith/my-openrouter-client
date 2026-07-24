@@ -41,6 +41,10 @@ typedef struct {
                                   appended here instead of stderr (for
                                   callers whose screen is transient,
                                   e.g. the alternate-screen stream) */
+    Buffer     *images;        /* when set, any generated-image data URLs
+                                  in the reply are appended here, one per
+                                  line (image-output models). NULL to
+                                  ignore image parts. */
 } OrRequest;
 
 /*

@@ -30,6 +30,10 @@
  * text as multimodal content (vision-capable models only; support is
  * checked against the OpenRouter model metadata on first paste).
  *
+ * Images a model generates are saved under conversations/generated/ and,
+ * on Kitty-graphics terminals, rendered inline; an [image: path] marker
+ * is kept in the conversation text (see image.c).
+ *
  * Conversations are stored in conversations/<name>.jsonl, one
  * {"role":...,"content":...} object per line.
  */
@@ -48,6 +52,7 @@
 #include "clipboard.h"
 #include "config.h"
 #include "conv.h"
+#include "image.h"
 #include "jsonutil.h"
 #include "lineedit.h"
 #include "md.h"
@@ -65,6 +70,9 @@ constexpr size_t NAME_CAP = 64;
 
 /* Where pasted clipboard images are saved before being inlined. */
 #define ORC_ATTACH_DIR ORC_CONV_DIR "/attachments"
+
+/* Where model-generated images are saved. */
+#define ORC_GENERATED_DIR ORC_CONV_DIR "/generated"
 
 /* Most images attachable to a single message. */
 constexpr size_t MAX_PENDING_IMAGES = 16;
@@ -532,6 +540,51 @@ static void rollback_turn(Buffer *items, size_t len0,
 }
 
 /*
+ * Save and render any generated images returned in `images` (newline-
+ * separated data URLs), appending an "[image: <path>]" marker for each to
+ * `disp` — the text that gets persisted, so a resumed conversation shows
+ * the reference. Images render inline on Kitty-protocol terminals,
+ * otherwise the saved path is printed. Best-effort: a save/render failure
+ * is reported but does not fail the turn.
+ */
+static void render_generated_images(Buffer *images, Buffer *disp, bool color)
+{
+    if (!images->len)
+        return;
+    if (conv_ensure_dir() != 0 ||
+        (mkdir(ORC_GENERATED_DIR, 0755) != 0 && errno != EEXIST)) {
+        fprintf(stderr, "warning: cannot create %s/\n", ORC_GENERATED_DIR);
+        return;
+    }
+
+    char *urls = strdup(images->data);
+    if (!urls)
+        return;
+    long ts = (long)time(nullptr);
+    int idx = 0;
+    for (char *url = strtok(urls, "\n"); url; url = strtok(nullptr, "\n")) {
+        idx++;
+        char *img = img_save_data_url(url, ORC_GENERATED_DIR, ts, idx);
+        if (!img) {
+            fprintf(stderr, "warning: could not save a generated image\n");
+            continue;
+        }
+        bool shown = img_render_kitty(url);
+        const char *fmt = shown
+            ? (color ? "\033[2m(saved: %s)\033[0m\n" : "(saved: %s)\n")
+            : "[image saved: %s]\n";
+        printf(fmt, img);
+
+        char marker[PATH_CAP + 16];
+        snprintf(marker, sizeof marker, "%s[image: %s]",
+                 disp->len ? "\n" : "", img);
+        (void)buf_append_str(disp, marker);
+        free(img);
+    }
+    free(urls);
+}
+
+/*
  * Run one exchange: append the user message to the in-memory history
  * (and file, if any), call the API with the full history, then record
  * the assistant's reply. Returns 0 on success, -1 on failure — the
@@ -595,6 +648,10 @@ static int run_turn(const OrRequest *base, Buffer *items,
     OrRequest req = *base;
     req.messages_json = msgs.data;
 
+    /* Collect any images an image-output model returns in the reply. */
+    Buffer gen_images = {0};
+    req.images = &gen_images;
+
     /* render == re-render the finished reply with Markdown styling.
      * base->markdown is already gated to an interactive color terminal.
      * `live` streams the plain tokens on the alternate screen; otherwise
@@ -640,6 +697,7 @@ static int run_turn(const OrRequest *base, Buffer *items,
 
     buf_free(&msgs);
     if (rc != 0) {
+        buf_free(&gen_images);
         rollback_turn(items, len0, path, fsize0);
         return -1;
     }
@@ -649,13 +707,22 @@ static int run_turn(const OrRequest *base, Buffer *items,
         md_render(reply, md_color_enabled());
     }
 
+    /* Persist the text plus an [image: path] marker per generated image
+     * (saved and, on Kitty terminals, rendered inline here). */
+    Buffer disp = {0};
+    (void)buf_append_str(&disp, reply);
+    render_generated_images(&gen_images, &disp, md_color_enabled());
+    buf_free(&gen_images);
+    const char *persist = disp.data ? disp.data : reply;
+
     rc = 0;
-    if (conv_items_add(items, "assistant", reply) != 0) {
+    if (conv_items_add(items, "assistant", persist) != 0) {
         fprintf(stderr, "error: out of memory\n");
         rc = -1;
-    } else if (path && conv_append(path, "assistant", reply) != 0) {
+    } else if (path && conv_append(path, "assistant", persist) != 0) {
         rc = -1;
     }
+    buf_free(&disp);
     if (out_reply) {
         free(*out_reply);       /* drop the previous turn's retained reply */
         *out_reply = reply;     /* hand ownership to the caller           */

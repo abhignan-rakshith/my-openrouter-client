@@ -138,6 +138,16 @@ project grows, append new features in the section where they best fit.
 - Up to 16 pending images per message; saved as PNGs under `conversations/attachments/`
 - Resumed history shows the text part (with `[Image N]` markers) of multimodal messages
 
+### Image output (generation)
+
+- Generated images are parsed from the reply's `images` array (both streaming `delta.images` and non-streaming `message.images`), in the same `image_url` data-URL shape used for input
+- No request changes: image-output models return images by default; sending a `modalities` param would break text-only models, so it is never sent
+- Base64-decoded and saved under `conversations/generated/img-<ts>-N.<ext>`, extension from the data-URL mime (png, jpeg, …); multiple images per reply supported
+- Inline rendering via the Kitty graphics protocol on supporting terminals (kitty, Ghostty, WezTerm — detected from `KITTY_WINDOW_ID`/`TERM`/`TERM_PROGRAM`); PNG only (`f=100`), chunked transmission
+- Graceful fallback to printing the saved path when inline rendering isn't available (non-PNG or unsupported terminal)
+- Image-only replies (null text content) are handled as success, not an error
+- Persisted as an `[image: <path>]` marker in the conversation text, so a resumed chat references the file (image data is not stored in history)
+
 ## 10. API transport
 
 - OpenRouter `/chat/completions` POST via libcurl (streaming and single-shot paths)

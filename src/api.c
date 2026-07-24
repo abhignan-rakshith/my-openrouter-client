@@ -93,8 +93,37 @@ typedef struct {
     OrStreamCb on_update; /* live-render callback, or NULL              */
     void      *on_update_user;
     Buffer    *errs;      /* error sink from the request, or NULL       */
+    Buffer    *images;    /* generated-image data URLs sink, or NULL    */
     bool       cancelled; /* user pressed Esc; keep the partial reply   */
 } StreamState;
+
+/*
+ * Append each image_url.url in the "images" array reachable from `scope`
+ * (a delta or message object) to `out`, one per line. Uses the
+ * depth-aware iterator so a data URL's contents can't mis-split the
+ * array. No-op when there is no images array.
+ */
+static void collect_images(const char *scope, Buffer *out)
+{
+    const char *arr = json_find_key(scope, "images");
+    if (!arr || *arr != '[')
+        return;
+    const char *cur = arr;
+    char *obj;
+    while ((obj = json_array_next_object(&cur)) != nullptr) {
+        const char *iu = json_find_key(obj, "image_url");
+        const char *u = iu ? json_find_key(iu, "url") : nullptr;
+        if (u && *u == '"') {
+            char *url = json_decode_string(u, nullptr);
+            if (url) {
+                if (buf_append_str(out, url) == 0)
+                    (void)buf_append_str(out, "\n");
+                free(url);
+            }
+        }
+        free(obj);
+    }
+}
 
 static void stream_stop_spinner(StreamState *st)
 {
@@ -117,6 +146,15 @@ static void sse_line(StreamState *st, const char *line)
         data++;
     if (strncmp(data, "[DONE]", 6) == 0)
         return;
+
+    /* Generated images ride in delta.images, on a chunk whose content is
+     * empty — so collect them before the empty-content early return. */
+    if (st->images) {
+        const char *choices = json_find_key(data, "choices");
+        const char *delta = choices ? json_find_key(choices, "delta") : nullptr;
+        if (delta)
+            collect_images(delta, st->images);
+    }
 
     char *piece = extract_delta(data);
     if (piece) {
@@ -370,6 +408,7 @@ int or_chat(const OrRequest *req, char **reply)
     st.on_update = req->on_update;
     st.on_update_user = req->on_update_user;
     st.errs = req->errs;
+    st.images = req->images;
     /* The callback owns display when present, so plain echo is off then. */
     st.printing = req->stream && !req->quiet && !st.on_update;
     Spinner *spinner = req->spinner ? spinner_start("Thinking") : nullptr;
@@ -437,12 +476,15 @@ int or_chat(const OrRequest *req, char **reply)
         emit_error(req->errs, "error: request failed: %s\n",
                    st.oom ? "out of memory" : curl_easy_strerror(rc));
     } else if (req->stream) {
-        if (st.reply.len && !st.got_error) {
+        bool have_img = req->images && req->images->len;
+        if ((st.reply.len || have_img) && !st.got_error) {
             if (st.printing)
                 fputc('\n', stdout);
-            *reply = st.reply.data; /* transfer ownership */
+            /* An image-only reply has no text; hand back an empty string
+             * so the contract (non-NULL on success) holds. */
+            *reply = st.reply.data ? st.reply.data : strdup("");
             st.reply.data = nullptr;
-            result = 0;
+            result = *reply ? 0 : -1;
         } else if (st.got_error) {
             /* The SSE error event was already reported as it arrived. */
             if (st.reply.len)
@@ -456,11 +498,21 @@ int or_chat(const OrRequest *req, char **reply)
         }
     } else {
         char *content = resp.data ? extract_content(resp.data) : nullptr;
-        if (content) {
-            if (!req->quiet)
+        if (req->images && resp.data) {
+            const char *choices = json_find_key(resp.data, "choices");
+            const char *msg = choices ? json_find_key(choices, "message")
+                                      : nullptr;
+            if (msg)
+                collect_images(msg, req->images);
+        }
+        bool have_img = req->images && req->images->len;
+        if (content || have_img) {
+            if (!content)
+                content = strdup("");   /* image-only reply: empty text */
+            if (content && !req->quiet && *content)
                 printf("%s\n", content);
-            *reply = content; /* transfer ownership */
-            result = 0;
+            *reply = content; /* transfer ownership (may be "") */
+            result = content ? 0 : -1;
         } else {
             report_api_error(req->errs, http_status, retry_after,
                              resp.data);
