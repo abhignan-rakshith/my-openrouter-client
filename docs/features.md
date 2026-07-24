@@ -46,6 +46,7 @@ project grows, append new features in the section where they best fit.
 - Durable append (fflush + fclose), file created on first write
 - Prior history replayed on resume (`--- Previous messages ---`), styled like the live prompt
 - `/rename NAME` renames the live conversation; refuses to overwrite an existing target, tolerates a not-yet-created source
+- `/save [NAME]` exports the last assistant reply as clean Markdown to `saves/<name>.md` (timestamped default name, `.md` auto-appended, `/` rejected); works on a resumed conversation by recalling the last reply from disk
 - Both plain-string and pre-encoded-JSON (multimodal) content variants for append and in-memory add
 
 ## 5. Interactive REPL
