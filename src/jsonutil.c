@@ -223,6 +223,60 @@ const char *json_find_key(const char *json, const char *key)
     return nullptr;
 }
 
+char *json_array_next_object(const char **cursor)
+{
+    const char *p = *cursor;
+
+    /* Advance to the next element's opening brace. Only '[' , ',' and
+     * whitespace legitimately precede it; ']' (or end) means no more. */
+    while (*p && *p != '{' && *p != ']')
+        p++;
+    if (*p != '{') {
+        *cursor = p;
+        return nullptr;
+    }
+
+    /* Walk to the matching close brace, tracking nesting and skipping
+     * string contents (so a '{' or '}' inside a value cannot mis-delimit
+     * the object). */
+    const char *start = p;
+    int depth = 0;
+    bool in_str = false;
+    for (; *p; p++) {
+        char c = *p;
+        if (in_str) {
+            if (c == '\\' && p[1])
+                p++;                /* skip the escaped byte */
+            else if (c == '"')
+                in_str = false;
+            continue;
+        }
+        if (c == '"')
+            in_str = true;
+        else if (c == '{')
+            depth++;
+        else if (c == '}' && --depth == 0) {
+            p++;                    /* include the closing brace */
+            break;
+        }
+    }
+    if (depth != 0) {               /* truncated / malformed: stop */
+        *cursor = p;
+        return nullptr;
+    }
+
+    size_t len = (size_t)(p - start);
+    char *obj = malloc(len + 1);
+    if (!obj) {
+        *cursor = p;
+        return nullptr;
+    }
+    memcpy(obj, start, len);
+    obj[len] = '\0';
+    *cursor = p;
+    return obj;
+}
+
 /* ------------------------------------------------------------------ */
 /* Response extractors                                                 */
 /* ------------------------------------------------------------------ */

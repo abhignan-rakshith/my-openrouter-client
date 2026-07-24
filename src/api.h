@@ -66,4 +66,13 @@ int or_chat(const OrRequest *req, char **reply);
  */
 int or_model_supports_images(const char *api_key, const char *model);
 
+/*
+ * Fetch the list of models that produce text output (the only kind orc
+ * can render), as the raw JSON response body, into *out. The server-side
+ * output_modalities=text filter keeps image/audio/embedding-only models
+ * out of the result. Returns 0 on success (*out holds the body), -1 on
+ * error (a diagnostic is printed; *out is left empty).
+ */
+int or_models_fetch(const char *api_key, Buffer *out);
+
 #endif /* ORC_API_H */

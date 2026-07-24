@@ -21,6 +21,13 @@ project grows, append new features in the section where they best fit.
 
 - `-m MODEL` flag to choose the model id
 - Resolution order: `-m` flag > saved config model > built-in `DEFAULT_MODEL`
+- `/model` in-chat picker: switch the active model mid-session from a live-filtered list
+  - Server-side `output_modalities=text` filter — only models orc can render are fetched (no image/audio/embedding-only models)
+  - Alternate-screen UI: type to filter (id/name), ↑/↓ to move, Enter to select, Esc to cancel — leaves scrollback and history untouched
+  - Columns: context length, input/output price ($/M tokens), and a vision-input flag
+  - Star favourites with Tab; stars persist in the user config (`stars=`) and sort to the top on future opens
+  - The chosen model is saved as the default (user config `model=`), so it persists across restarts (a `-m` flag still overrides for that run)
+  - Parsed with a depth-aware JSON array walker (`json_array_next_object`), so nested/brace-containing fields never mis-delimit a model object
 
 ## 3. Configuration & API key
 

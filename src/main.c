@@ -20,6 +20,7 @@
  *
  * Interactive commands:
  *   /help         show commands and key bindings (on the alt screen)
+ *   /model        switch the model via a searchable picker (starrable)
  *   /rename NAME  rename the current conversation
  *   /save [NAME]  export the last reply to saves/<name>.md
  *   /quit         end the session
@@ -50,7 +51,9 @@
 #include "jsonutil.h"
 #include "lineedit.h"
 #include "md.h"
+#include "models.h"
 #include "save.h"
+#include "screen.h"
 #include "userconfig.h"
 
 #define DEFAULT_MODEL "google/gemini-3.6-flash"
@@ -275,29 +278,6 @@ static const char *you_prompt(bool markdown)
 {
     return (markdown && md_color_enabled())
         ? "\033[1;38;5;84myou>\033[0m " : "you> ";
-}
-
-/* Enter / leave the terminal's alternate screen buffer. The alternate
- * buffer has no scrollback, so text streamed into it disappears completely
- * on exit and the original screen is restored — no matter how long the
- * reply was. This is how the live plain stream is shown and then discarded
- * before the formatted reply is drawn on the main screen. */
-/* Set while the alternate screen is active, so a fatal signal can restore
- * the main screen before the process dies. sig_atomic_t for handler safety. */
-static volatile sig_atomic_t g_in_alt_screen = 0;
-
-static void alt_screen_enter(void)
-{
-    fputs("\033[?1049h\033[H", stdout);
-    fflush(stdout);
-    g_in_alt_screen = 1;        /* mark only once the enter is on the wire */
-}
-
-static void alt_screen_leave(void)
-{
-    fputs("\033[?1049l", stdout);
-    fflush(stdout);
-    g_in_alt_screen = 0;        /* clear only after the leave is on the wire */
 }
 
 /*
@@ -632,7 +612,7 @@ static int run_turn(const OrRequest *base, Buffer *items,
          * transient banner heads it until the first repaint. Errors are
          * collected rather than printed: anything written to the
          * alternate screen is wiped when it is left. */
-        alt_screen_enter();
+        screen_alt_enter();
         print_assistant_banner();
         fflush(stdout);
         req.on_update = stream_repaint;
@@ -653,7 +633,7 @@ static int run_turn(const OrRequest *base, Buffer *items,
     if (req.esc_cancel)
         le_raw_off();
     if (live)               /* drop the raw stream; back to the main screen */
-        alt_screen_leave();
+        screen_alt_leave();
     if (errs.len)           /* now safe to show what went wrong */
         fputs(errs.data, stderr);
     buf_free(&errs);
@@ -790,6 +770,7 @@ static void print_help_page(const OrRequest *base, bool color)
 {
     static const HelpRow commands[] = {
         { "/help, /?",     "show this help" },
+        { "/model",        "switch the model (searchable, star favourites)" },
         { "/save [NAME]",  "export the last reply to saves/<name>.md" },
         { "/rename NAME",  "rename the current conversation" },
         { "/quit, /exit",  "end the session (also Ctrl-D)" },
@@ -829,7 +810,7 @@ static void show_help(const OrRequest *base)
         return;
     }
 
-    alt_screen_enter();
+    screen_alt_enter();
     print_help_page(base, color);
     if (color)
         fputs("\033[2mPress any key to return.\033[0m", stdout);
@@ -845,7 +826,7 @@ static void show_help(const OrRequest *base)
             ;
         le_raw_off();
     }
-    alt_screen_leave();
+    screen_alt_leave();
 }
 
 /*
@@ -894,6 +875,9 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
     /* Seed from disk so /save works on a resumed conversation, not just
      * after a fresh turn this session. */
     char *last_reply = path ? conv_last_reply(path) : nullptr;
+    /* Owns the id when /model switches the active model this session
+     * (base->model then points here). */
+    char *model_override = nullptr;
     int status = 0;
     for (;;) {
         putchar('\n');
@@ -930,6 +914,34 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
             free(line);
             continue;
         }
+        if (strcmp(line, "/model") == 0) {
+            bool outputs_images = false;
+            char *picked = models_pick(base->api_key, base->model,
+                                       &outputs_images);
+            if (picked) {
+                free(model_override);
+                model_override = picked;
+                base->model = model_override;
+                pc.model    = base->model;  /* recheck image support anew */
+                pc.support  = -2;
+                /* Persist as the default so the choice survives restarts
+                 * (config precedence: -m flag > saved model > built-in). */
+                bool saved = uconf_set("model", base->model) == 0;
+                if (md_color_enabled())
+                    printf("Switched to \033[1;38;5;141m%s\033[0m%s\n",
+                           base->model,
+                           saved ? "  \033[2m(saved as default)\033[0m" : "");
+                else
+                    printf("Switched to %s%s\n", base->model,
+                           saved ? "  (saved as default)" : "");
+                if (outputs_images)
+                    fprintf(stderr, "note: this model can generate images; "
+                            "orc shows the text reply only.\n");
+            }
+            clear_pending(&pc);     /* pastes don't survive the command */
+            free(line);
+            continue;
+        }
 
         /* Attach any pasted images whose placeholder survived editing. */
         char *mm = nullptr;
@@ -954,6 +966,7 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
     }
     clear_pending(&pc);
     free(last_reply);
+    free(model_override);
     return status;
 }
 

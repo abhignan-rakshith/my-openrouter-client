@@ -39,6 +39,19 @@ char *json_decode_string(const char *p, const char **endp);
  */
 const char *json_find_key(const char *json, const char *key);
 
+/*
+ * Iterate the object elements of a JSON array. *cursor should start at
+ * (or before) the array — e.g. the value pointer json_find_key returns
+ * for the array's key. Each call returns a malloc'd, NUL-terminated copy
+ * of the next top-level object (the caller frees it) and advances *cursor
+ * past it; returns NULL when no further object remains (end of array,
+ * truncation, or OOM). Nested objects/arrays and string contents are
+ * skipped, so an object is delimited correctly even when a string value
+ * contains braces. Returning a bounded copy lets json_find_key run on it
+ * safely without reading into the following element.
+ */
+char *json_array_next_object(const char **cursor);
+
 /* choices[0].message.content of a non-streaming response, or NULL. */
 char *extract_content(const char *json);
 
