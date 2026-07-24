@@ -3,9 +3,12 @@
  *
  * Image-output models return pictures in the reply as data: URLs
  * (data:<mime>;base64,<payload>). This module base64-decodes them to
- * files and, on terminals that speak the Kitty graphics protocol
- * (kitty, Ghostty, WezTerm), renders them inline. orc's text pipeline is
- * unaffected — this only handles the image parts the API returns.
+ * files and renders them inline by shelling out to `chafa`, which handles
+ * every image format and the terminal's graphics protocol (Kitty on
+ * kitty/Ghostty/WezTerm, Sixel, iTerm2, or symbol art) itself. chafa is
+ * an optional runtime helper — like the clipboard tools — so callers fall
+ * back to showing the saved path when it is absent. orc's text pipeline
+ * is unaffected; this only handles the image parts the API returns.
  */
 #ifndef ORC_IMAGE_H
 #define ORC_IMAGE_H
@@ -20,15 +23,20 @@
 char *img_save_data_url(const char *data_url, const char *dir,
                         long ts, int index);
 
-/* True if the terminal appears to support the Kitty graphics protocol. */
-bool img_terminal_supports_graphics(void);
+/*
+ * Render the image file at `path` inline via chafa. Returns true if it
+ * was displayed; false when stdout is not a terminal, chafa is not
+ * installed, the path is unsafe to pass to the shell, or chafa failed —
+ * so the caller can fall back to printing the path.
+ */
+bool img_render_file(const char *path);
 
 /*
- * Render a data: URL inline via the Kitty graphics protocol. Only PNG is
- * supported (transmit format f=100); returns false for other formats, on
- * an unsupported terminal, or on malformed input, so the caller can fall
- * back to printing the saved path.
+ * Render every image referenced by an "[image: <path>]" marker in `text`
+ * (as written into persisted assistant messages), each via
+ * img_render_file. Used to re-display images when a conversation is
+ * resumed. Missing/unrenderable files are simply skipped.
  */
-bool img_render_kitty(const char *data_url);
+void img_render_markers(const char *text);
 
 #endif /* ORC_IMAGE_H */

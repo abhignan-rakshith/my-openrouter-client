@@ -143,10 +143,11 @@ project grows, append new features in the section where they best fit.
 - Generated images are parsed from the reply's `images` array (both streaming `delta.images` and non-streaming `message.images`), in the same `image_url` data-URL shape used for input
 - No request changes: image-output models return images by default; sending a `modalities` param would break text-only models, so it is never sent
 - Base64-decoded and saved under `conversations/generated/img-<ts>-N.<ext>`, extension from the data-URL mime (png, jpeg, …); multiple images per reply supported
-- Inline rendering via the Kitty graphics protocol on supporting terminals (kitty, Ghostty, WezTerm — detected from `KITTY_WINDOW_ID`/`TERM`/`TERM_PROGRAM`); PNG only (`f=100`), chunked transmission
-- Graceful fallback to printing the saved path when inline rendering isn't available (non-PNG or unsupported terminal)
+- Inline rendering by shelling out to `chafa`, which handles every format and the terminal's graphics protocol itself (Kitty on kitty/Ghostty/WezTerm, Sixel, iTerm2, or symbol art)
+- `chafa` is an optional runtime helper (like the clipboard tools): when it is absent, or stdout is not a terminal, the saved path is printed instead
+- Shell-injection guard on the path before invoking chafa; rendered as a modest inline preview (`--size=72x24`)
 - Image-only replies (null text content) are handled as success, not an error
-- Persisted as an `[image: <path>]` marker in the conversation text, so a resumed chat references the file (image data is not stored in history)
+- Persisted as an `[image: <path>]` marker in the conversation text (image data is not stored in history); resuming a conversation re-renders each referenced image via chafa
 
 ## 10. API transport
 

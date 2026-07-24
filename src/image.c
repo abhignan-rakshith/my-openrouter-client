@@ -129,50 +129,59 @@ char *img_save_data_url(const char *data_url, const char *dir,
 }
 
 /* ------------------------------------------------------------------ */
-/* Kitty graphics protocol                                             */
+/* Inline rendering via chafa                                          */
 /* ------------------------------------------------------------------ */
 
-bool img_terminal_supports_graphics(void)
+/* Cell box chafa fits the image into (width x height), preserving aspect.
+ * A modest inline preview rather than a screen-filling render. */
+#define CHAFA_SIZE "72x24"
+
+/* True if the chafa helper is on PATH. Cached after the first check. */
+static bool chafa_available(void)
 {
-    if (getenv("KITTY_WINDOW_ID"))
-        return true;
-    const char *term = getenv("TERM");
-    if (term && (strstr(term, "kitty") || strstr(term, "ghostty")))
-        return true;
-    const char *tp = getenv("TERM_PROGRAM");
-    if (tp && (strcmp(tp, "ghostty") == 0 || strcmp(tp, "WezTerm") == 0))
-        return true;
-    return false;
+    static int cached = -1;
+    if (cached < 0)
+        cached = system("command -v chafa >/dev/null 2>&1") == 0 ? 1 : 0;
+    return cached == 1;
 }
 
-bool img_render_kitty(const char *data_url)
+bool img_render_file(const char *path)
 {
-    char ext[16];
-    const char *payload = data_url_payload(data_url, ext, sizeof ext);
-    if (!payload || strcmp(ext, "png") != 0)   /* f=100 accepts PNG only */
+    if (!isatty(STDOUT_FILENO))
         return false;
-    if (!img_terminal_supports_graphics())
+    /* The path is program-generated, but reject anything that could break
+     * out of the single-quoted shell word regardless. */
+    if (strpbrk(path, "'\"\\"))
         return false;
-
-    size_t plen = strlen(payload);
-    if (plen == 0)
+    if (!chafa_available())
         return false;
 
-    /* Direct transmit + display (a=T), PNG (f=100). The base64 payload is
-     * sent in <=4096-byte chunks; m=1 marks "more follows", m=0 the last.
-     * Only the first chunk carries the format keys. */
-    constexpr size_t CHUNK = 4096;
-    for (size_t off = 0; off < plen; off += CHUNK) {
-        size_t n = plen - off < CHUNK ? plen - off : CHUNK;
-        int more = (off + n < plen) ? 1 : 0;
-        if (off == 0)
-            printf("\033_Gf=100,a=T,m=%d;", more);
-        else
-            printf("\033_Gm=%d;", more);
-        fwrite(payload + off, 1, n, stdout);
-        fputs("\033\\", stdout);
-    }
-    putchar('\n');
+    char cmd[600];
+    int n = snprintf(cmd, sizeof cmd,
+                     "chafa --size=%s '%s'", CHAFA_SIZE, path);
+    if (n < 0 || (size_t)n >= sizeof cmd)
+        return false;
+
     fflush(stdout);
-    return true;
+    return system(cmd) == 0;
+}
+
+void img_render_markers(const char *text)
+{
+    static const char tag[] = "[image: ";
+    size_t taglen = sizeof tag - 1;
+    for (const char *p = text; (p = strstr(p, tag)) != nullptr; ) {
+        const char *start = p + taglen;
+        const char *end = strchr(start, ']');
+        if (!end)
+            break;
+        size_t len = (size_t)(end - start);
+        char path[512];
+        if (len < sizeof path) {
+            memcpy(path, start, len);
+            path[len] = '\0';
+            img_render_file(path);
+        }
+        p = end + 1;
+    }
 }

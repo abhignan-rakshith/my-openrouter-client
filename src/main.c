@@ -30,9 +30,10 @@
  * text as multimodal content (vision-capable models only; support is
  * checked against the OpenRouter model metadata on first paste).
  *
- * Images a model generates are saved under conversations/generated/ and,
- * on Kitty-graphics terminals, rendered inline; an [image: path] marker
- * is kept in the conversation text (see image.c).
+ * Images a model generates are saved under conversations/generated/ and
+ * rendered inline via chafa (any format; a saved-path note when chafa is
+ * absent); an [image: path] marker is kept in the conversation text so a
+ * resumed conversation re-renders them (see image.c).
  *
  * Conversations are stored in conversations/<name>.jsonl, one
  * {"role":...,"content":...} object per line.
@@ -569,7 +570,7 @@ static void render_generated_images(Buffer *images, Buffer *disp, bool color)
             fprintf(stderr, "warning: could not save a generated image\n");
             continue;
         }
-        bool shown = img_render_kitty(url);
+        bool shown = img_render_file(img);
         const char *fmt = shown
             ? (color ? "\033[2m(saved: %s)\033[0m\n" : "(saved: %s)\n")
             : "[image saved: %s]\n";

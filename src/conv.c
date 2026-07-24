@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #include "conv.h"
+#include "image.h"
 #include "jsonutil.h"
 #include "md.h"
 
@@ -222,6 +223,8 @@ static void show_message(const char *role, const char *content, int markdown)
         } else {
             printf("\nassistant> %s\n", content);
         }
+        /* Re-display any images this reply generated (best-effort). */
+        img_render_markers(content);
     } else {
         printf("\n%s> %s\n", role, content);
     }
