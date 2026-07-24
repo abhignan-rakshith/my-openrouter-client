@@ -19,6 +19,7 @@
  * only the final formatted copy remains in the scrollback.
  *
  * Interactive commands:
+ *   /help         show commands and key bindings (on the alt screen)
  *   /rename NAME  rename the current conversation
  *   /save [NAME]  export the last reply to saves/<name>.md
  *   /quit         end the session
@@ -87,8 +88,9 @@ static void usage(const char *prog)
         "\n"
         "With no prompt, an interactive chat session starts. In a terminal the\n"
         "reply renders live as Markdown as it streams.\n"
-        "In the chat, /rename NAME renames the conversation and\n"
-        "/save [NAME] exports the last reply to saves/<name>.md.\n"
+        "In the chat, /help lists every command and key binding;\n"
+        "/rename NAME renames the conversation and /save [NAME] exports\n"
+        "the last reply to saves/<name>.md.\n"
         "/quit (or Ctrl-D) ends the session.\n"
         "\\+Enter (or Shift+Enter in supporting terminals) starts a new\n"
         "line without sending, for multi-line messages.\n"
@@ -760,29 +762,118 @@ static void handle_save(char *args, const char *last_reply)
     printf("Saved reply to %s\n", path);
 }
 
-/* Print the session header, and prior history when resuming. */
+/* One row of the help page: a key/command and what it does. */
+typedef struct { const char *key, *desc; } HelpRow;
+
+/* Print a titled block of help rows, aligned, colored when appropriate.
+ * Section titles use the assistant purple, keys the you-green, so the
+ * page reads as part of the same interface. */
+static void help_section(const char *title, const HelpRow *rows, size_t n,
+                         bool color)
+{
+    if (color)
+        printf("\033[1;38;5;141m%s\033[0m\n", title);
+    else
+        printf("%s\n", title);
+    for (size_t i = 0; i < n; i++) {
+        if (color)
+            printf("  \033[1;38;5;84m%-20s\033[0m %s\n",
+                   rows[i].key, rows[i].desc);
+        else
+            printf("  %-20s %s\n", rows[i].key, rows[i].desc);
+    }
+    putchar('\n');
+}
+
+/* Render the help page (used on the alternate screen, or inline when piped). */
+static void print_help_page(const OrRequest *base, bool color)
+{
+    static const HelpRow commands[] = {
+        { "/help, /?",     "show this help" },
+        { "/save [NAME]",  "export the last reply to saves/<name>.md" },
+        { "/rename NAME",  "rename the current conversation" },
+        { "/quit, /exit",  "end the session (also Ctrl-D)" },
+    };
+    static const HelpRow editing[] = {
+        { "\\+Enter, S-Enter", "new line without sending" },
+        { "Up / Down",         "recall history / move between lines" },
+        { "Ctrl-A / Ctrl-E",   "jump to start / end of line" },
+        { "Ctrl-K / Ctrl-U",   "delete to end / start of line" },
+        { "Ctrl-W",            "delete the previous word" },
+        { "Ctrl-L",            "clear the screen" },
+        { "Ctrl-V",            "paste an image from the clipboard" },
+        { "Esc",               "interrupt a streaming reply" },
+    };
+
+    if (color)
+        printf("\033[1;38;5;141morc\033[0m — chatting with %s\n\n", base->model);
+    else
+        printf("orc — chatting with %s\n\n", base->model);
+    help_section("Commands", commands,
+                 sizeof commands / sizeof *commands, color);
+    help_section("Editing & input", editing,
+                 sizeof editing / sizeof *editing, color);
+}
+
+/*
+ * Show the help page. On a terminal it is painted on the alternate screen
+ * and dismissed with any key, so the conversation scrollback and history
+ * are left completely undisturbed. When stdin/stdout is not a terminal it
+ * is simply printed inline.
+ */
+static void show_help(const OrRequest *base)
+{
+    bool color = md_color_enabled();
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        print_help_page(base, color);
+        return;
+    }
+
+    alt_screen_enter();
+    print_help_page(base, color);
+    if (color)
+        fputs("\033[2mPress any key to return.\033[0m", stdout);
+    else
+        fputs("Press any key to return.", stdout);
+    fflush(stdout);
+
+    /* Wait for one keypress in raw mode, then restore the main screen —
+     * the help page vanishes with the alternate buffer. */
+    if (le_raw_on() == 0) {
+        char c;
+        while (read(STDIN_FILENO, &c, 1) < 0 && errno == EINTR)
+            ;
+        le_raw_off();
+    }
+    alt_screen_leave();
+}
+
+/*
+ * Print a quiet one-line session banner — the model, and a pointer to
+ * /help for everything else — then replay prior history when resuming.
+ */
 static int repl_intro(const OrRequest *base, const Buffer *items,
                       const char *path)
 {
-    printf("Chatting with %s — /quit or Ctrl-D to exit.\n", base->model);
-    printf("Markdown: %s\n", base->markdown
-           ? "on (rendered live as it streams)" : "off");
+    bool color = md_color_enabled();
+    if (color)
+        printf("\033[1;38;5;141morc\033[0m \033[2m·\033[0m %s", base->model);
+    else
+        printf("orc · %s", base->model);
     if (isatty(STDIN_FILENO)) {
-        printf("Ctrl+V pastes an image from the clipboard.\n");
-        printf("\\+Enter (or Shift+Enter) starts a new line.\n");
-        printf("Multi-line pastes show as [Pasted #N] and expand on send.\n");
-        printf("Esc interrupts a reply, keeping the partial text.\n");
-        printf("Up/Down cycle through your message history.\n");
-        printf("/save [NAME] writes the last reply to saves/<name>.md.\n");
+        const char *hint = "  /help for commands · /quit to exit";
+        if (color)
+            printf("\033[2m%s\033[0m", hint);
+        else
+            printf("%s", hint);
     }
-    if (path) {
-        printf("Conversation: %s\n", path);
-        if (items->len) {
-            printf("\n--- Previous messages ---\n");
-            if (conv_show(path, base->markdown) != 0)
-                return 1;
-            printf("\n--- Resuming chat ---\n");
-        }
+    putchar('\n');
+
+    if (path && items->len) {
+        printf("\n--- Previous messages ---\n");
+        if (conv_show(path, base->markdown) != 0)
+            return 1;
+        printf("\n--- Resuming chat ---\n");
     }
     return 0;
 }
@@ -829,6 +920,12 @@ static int repl(OrRequest *base, Buffer *items, char *path, size_t pathsz)
         }
         if (is_command(line, "/save", 5)) {
             handle_save(line + 5, last_reply);
+            clear_pending(&pc);     /* pastes don't survive the command */
+            free(line);
+            continue;
+        }
+        if (strcmp(line, "/help") == 0 || strcmp(line, "/?") == 0) {
+            show_help(base);
             clear_pending(&pc);     /* pastes don't survive the command */
             free(line);
             continue;

@@ -52,6 +52,7 @@ project grows, append new features in the section where they best fit.
 ## 5. Interactive REPL
 
 - `/quit`, `/exit`, and Ctrl-D (EOF) end the session
+- `/help` (or `/?`) shows a styled command and key-binding reference on the alternate screen, dismissed with any key — leaves scrollback and history untouched
 - Colored `you>` / `assistant>` prompts and banners (256-color, TTY-gated)
 - Emacs-style editing keys: Ctrl-A/E (line start/end), Ctrl-K/U (kill to end/start), Ctrl-W (kill word), Ctrl-D (delete/EOF), Backspace joins lines
 - Ctrl-L clears the screen and repaints
